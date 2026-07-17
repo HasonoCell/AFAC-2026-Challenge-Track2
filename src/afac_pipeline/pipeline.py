@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +12,11 @@ from typing import Iterable
 
 from .api import FinixDocClient, FinixDocError, normalize_markdown_payload
 from .datasets import ImageRecord
-from .images import make_vertical_slices
+from .images import ImageSlice, make_grid_slices
+from .tables import try_reconstruct_grid_tables
+
+
+CACHE_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -23,7 +29,9 @@ class PredictionConfig:
     sleep_seconds: float = 0.0
     resume: bool = True
     slice_height: int | None = None
+    slice_width: int | None = None
     slice_overlap: int = 0
+    slice_x_overlap: int = 0
     max_width: int | None = None
     jpeg_quality: int = 95
     retries: int = 1
@@ -51,7 +59,8 @@ def run_prediction(
     records_after_offset = all_records[config.offset :]
     selected_records = records_after_offset[: config.limit] if config.limit else records_after_offset
 
-    config.cache_dir.mkdir(parents=True, exist_ok=True)
+    effective_cache_dir = _cache_dir_for_config(config)
+    effective_cache_dir.mkdir(parents=True, exist_ok=True)
     config.output_csv.parent.mkdir(parents=True, exist_ok=True)
     if config.errors_csv:
         config.errors_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -62,7 +71,7 @@ def run_prediction(
     api_calls = 0
 
     for index, record in enumerate(selected_records, start=1):
-        cache_path = _cache_path(config.cache_dir, record.file_name)
+        cache_path = _cache_path(effective_cache_dir, record.file_name)
         markdown: str
 
         try:
@@ -154,11 +163,13 @@ def _call_record(
     config: PredictionConfig,
 ) -> tuple[str, int]:
     image_bytes = record.read_bytes()
-    slices = make_vertical_slices(
+    slices = make_grid_slices(
         file_name=record.file_name,
         image_bytes=image_bytes,
+        slice_width=config.slice_width,
         slice_height=config.slice_height,
-        overlap=config.slice_overlap,
+        x_overlap=config.slice_x_overlap,
+        y_overlap=config.slice_overlap,
         max_width=config.max_width,
         jpeg_quality=config.jpeg_quality,
     )
@@ -167,8 +178,9 @@ def _call_record(
         print(f"calling API {record.file_name}")
     else:
         print(
-            f"calling API {record.file_name} as {len(slices)} vertical slices "
-            f"(height={config.slice_height}, overlap={config.slice_overlap})"
+            f"calling API {record.file_name} as {len(slices)} slices "
+            f"(width={config.slice_width}, height={config.slice_height}, "
+            f"x_overlap={config.slice_x_overlap}, y_overlap={config.slice_overlap})"
         )
 
     parts: list[str] = []
@@ -176,12 +188,16 @@ def _call_record(
         if len(slices) > 1:
             print(
                 f"  slice {slice_index}/{len(slices)} "
-                f"{image_slice.file_name} y={image_slice.y0}:{image_slice.y1}"
+                f"{image_slice.file_name} "
+                f"row={image_slice.row}/{image_slice.rows} "
+                f"col={image_slice.col}/{image_slice.cols} "
+                f"x={image_slice.x0}:{image_slice.x1} "
+                f"y={image_slice.y0}:{image_slice.y1}"
             )
         parts.append(_call_with_retries(client, image_slice.file_name, image_slice.image_bytes, config))
         if config.sleep_seconds > 0 and slice_index < len(slices):
             time.sleep(config.sleep_seconds)
-    return _merge_markdown_parts(parts), len(slices)
+    return _merge_sliced_markdown(slices, parts), len(slices)
 
 
 def _call_with_retries(
@@ -217,6 +233,39 @@ def _merge_markdown_parts(parts: list[str]) -> str:
     return "\n".join(merged_lines).strip() + "\n"
 
 
+def _merge_sliced_markdown(slices: list[ImageSlice], parts: list[str]) -> str:
+    if not slices or not parts:
+        return ""
+    reconstructed = try_reconstruct_grid_tables(slices, parts)
+    if reconstructed is not None:
+        return reconstructed
+    if len(slices) == 1 or all(image_slice.cols == 1 for image_slice in slices):
+        return _merge_markdown_parts(parts)
+
+    # Horizontal/grid slices cannot be faithfully merged by line overlap alone.
+    # Keep deterministic row-major order and embed lightweight HTML comments so
+    # the output remains traceable until the table-reconstruction milestone is
+    # implemented.
+    annotated_parts: list[str] = []
+    for image_slice, part in zip(slices, parts, strict=True):
+        annotated_parts.append(
+            "\n".join(
+                [
+                    (
+                        "<!-- "
+                        f"slice row={image_slice.row}/{image_slice.rows} "
+                        f"col={image_slice.col}/{image_slice.cols} "
+                        f"x={image_slice.x0}:{image_slice.x1} "
+                        f"y={image_slice.y0}:{image_slice.y1} "
+                        "-->"
+                    ),
+                    part.strip(),
+                ]
+            )
+        )
+    return "\n\n".join(annotated_parts).strip() + "\n"
+
+
 def _strip_edge_blank_lines(lines: list[str]) -> list[str]:
     start = 0
     end = len(lines)
@@ -233,6 +282,40 @@ def _line_overlap(left: list[str], right: list[str], max_lines: int) -> int:
         if left[-size:] == right[:size]:
             return size
     return 0
+
+
+def _cache_dir_for_config(config: PredictionConfig) -> Path:
+    return config.cache_dir / _cache_namespace(config)
+
+
+def _cache_namespace(config: PredictionConfig) -> str:
+    payload = {
+        "schema": CACHE_SCHEMA_VERSION,
+        "dry_run": config.dry_run,
+        "slice_width": config.slice_width,
+        "slice_height": config.slice_height,
+        "slice_x_overlap": config.slice_x_overlap,
+        "slice_overlap": config.slice_overlap,
+        "max_width": config.max_width,
+        "jpeg_quality": config.jpeg_quality,
+    }
+    digest = hashlib.sha1(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:10]
+    return (
+        f"v{CACHE_SCHEMA_VERSION}_"
+        f"mw{_cache_value(config.max_width)}_"
+        f"sw{_cache_value(config.slice_width)}_"
+        f"sh{_cache_value(config.slice_height)}_"
+        f"xo{config.slice_x_overlap}_"
+        f"yo{config.slice_overlap}_"
+        f"q{config.jpeg_quality}_"
+        f"{digest}"
+    )
+
+
+def _cache_value(value: int | None) -> str:
+    return "none" if value is None else str(value)
 
 
 def _cache_path(cache_dir: Path, file_name: str) -> Path:
