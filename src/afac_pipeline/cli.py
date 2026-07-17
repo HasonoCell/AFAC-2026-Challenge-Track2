@@ -219,6 +219,56 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reject candidate crop outputs shorter than this many characters.",
     )
     baseline_parser.add_argument(
+        "--table-repair-min-chars",
+        type=int,
+        default=100,
+        help=(
+            "If a table crop output is shorter than this many characters, retry "
+            "with content-box grid slices. Use 0 to disable."
+        ),
+    )
+    baseline_parser.add_argument(
+        "--table-repair-min-gain",
+        type=int,
+        default=300,
+        help="Only keep table repair output if it improves length by at least this many characters.",
+    )
+    baseline_parser.add_argument(
+        "--table-repair-grid",
+        default="4x4",
+        help="Content-box repair grid as ROWSxCOLS, for example 4x4 or 2x2.",
+    )
+    baseline_parser.add_argument(
+        "--table-repair-overlap",
+        type=int,
+        default=120,
+        help="Pixel overlap in both directions for content-box table repair slices.",
+    )
+    baseline_parser.add_argument(
+        "--table-repair-content-threshold",
+        type=int,
+        default=245,
+        help="Grayscale threshold for detecting non-white table content.",
+    )
+    baseline_parser.add_argument(
+        "--table-repair-content-scale",
+        type=float,
+        default=0.04,
+        help="Downsample scale used while detecting table content bounds.",
+    )
+    baseline_parser.add_argument(
+        "--table-repair-content-padding",
+        type=int,
+        default=200,
+        help="Padding around detected table content bounds before grid slicing.",
+    )
+    baseline_parser.add_argument(
+        "--table-repair-min-success-parts",
+        type=int,
+        default=4,
+        help="Minimum successful grid slices required before accepting table repair.",
+    )
+    baseline_parser.add_argument(
         "--no-resume",
         action="store_true",
         help="Ignore cached baseline markdown and call again.",
@@ -390,6 +440,15 @@ def cmd_baseline_submit(args: argparse.Namespace) -> None:
             retries=args.retries,
             retry_sleep_seconds=args.retry_sleep,
             min_chars=args.min_chars,
+            table_repair_min_chars=args.table_repair_min_chars,
+            table_repair_min_gain=args.table_repair_min_gain,
+            table_repair_rows=_parse_grid(args.table_repair_grid)[0],
+            table_repair_cols=_parse_grid(args.table_repair_grid)[1],
+            table_repair_overlap=args.table_repair_overlap,
+            table_repair_content_threshold=args.table_repair_content_threshold,
+            table_repair_content_scale=args.table_repair_content_scale,
+            table_repair_content_padding=args.table_repair_content_padding,
+            table_repair_min_success_parts=args.table_repair_min_success_parts,
             long_slice_height=args.long_slice_height,
             long_slice_overlap=args.long_slice_overlap,
             long_min_chars=args.long_min_chars,
@@ -443,6 +502,21 @@ def _parse_str_list(value: str, argument_name: str) -> tuple[str, ...]:
     if not parsed:
         raise SystemExit(f"{argument_name} must contain at least one value")
     return parsed
+
+
+def _parse_grid(value: str) -> tuple[int, int]:
+    normalized = value.lower().replace(" ", "")
+    if "x" not in normalized:
+        raise SystemExit("--table-repair-grid must be formatted as ROWSxCOLS")
+    row_text, col_text = normalized.split("x", 1)
+    try:
+        rows = int(row_text)
+        cols = int(col_text)
+    except ValueError as exc:
+        raise SystemExit("--table-repair-grid rows and cols must be integers") from exc
+    if rows <= 0 or cols <= 0:
+        raise SystemExit("--table-repair-grid rows and cols must be positive")
+    return rows, cols
 
 
 def _mock_template_names_for_full_run(args: argparse.Namespace) -> tuple[str, ...] | None:

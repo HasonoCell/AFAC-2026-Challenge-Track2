@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -37,6 +38,22 @@ class ImageSlice:
     cols: int = 1
 
 
+@dataclass(frozen=True)
+class ContentBox:
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+
+    @property
+    def width(self) -> int:
+        return self.x1 - self.x0
+
+    @property
+    def height(self) -> int:
+        return self.y1 - self.y0
+
+
 def make_vertical_slices(
     *,
     file_name: str,
@@ -56,6 +73,107 @@ def make_vertical_slices(
         max_width=max_width,
         jpeg_quality=jpeg_quality,
     )
+
+
+def detect_content_box(
+    *,
+    image_bytes: bytes,
+    threshold: int = 245,
+    sample_scale: float = 0.05,
+    padding: int = 150,
+) -> ContentBox:
+    """Find the bounding box of non-white-ish pixels in original coordinates."""
+
+    if not 0 <= threshold <= 255:
+        raise ValueError("content threshold must be between 0 and 255")
+    if sample_scale <= 0:
+        raise ValueError("sample scale must be positive")
+    if padding < 0:
+        raise ValueError("content padding must be >= 0")
+
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        width, height = image.size
+        sample_width = max(1, round(width * sample_scale))
+        sample_height = max(1, round(height * sample_scale))
+        grayscale = image.convert("L").resize(
+            (sample_width, sample_height),
+            Image.Resampling.BILINEAR,
+        )
+        mask = grayscale.point(lambda pixel: 255 if pixel < threshold else 0)
+        bbox = mask.getbbox()
+        if bbox is None:
+            return ContentBox(0, 0, width, height)
+
+        x_scale = width / sample_width
+        y_scale = height / sample_height
+        x0 = max(0, math.floor(bbox[0] * x_scale) - padding)
+        y0 = max(0, math.floor(bbox[1] * y_scale) - padding)
+        x1 = min(width, math.ceil(bbox[2] * x_scale) + padding)
+        y1 = min(height, math.ceil(bbox[3] * y_scale) + padding)
+        return ContentBox(x0, y0, x1, y1)
+
+
+def make_content_grid_slices(
+    *,
+    file_name: str,
+    image_bytes: bytes,
+    rows: int,
+    cols: int,
+    threshold: int = 245,
+    sample_scale: float = 0.05,
+    padding: int = 150,
+    x_overlap: int = 0,
+    y_overlap: int = 0,
+    jpeg_quality: int = 95,
+) -> list[ImageSlice]:
+    """Crop the detected content box into a deterministic row-major grid."""
+
+    if rows <= 0:
+        raise ValueError("content grid rows must be positive")
+    if cols <= 0:
+        raise ValueError("content grid cols must be positive")
+    if x_overlap < 0:
+        raise ValueError("content grid x overlap must be >= 0")
+    if y_overlap < 0:
+        raise ValueError("content grid y overlap must be >= 0")
+
+    content_box = detect_content_box(
+        image_bytes=image_bytes,
+        threshold=threshold,
+        sample_scale=sample_scale,
+        padding=padding,
+    )
+    x_edges = _even_edges(content_box.x0, content_box.x1, cols)
+    y_edges = _even_edges(content_box.y0, content_box.y1, rows)
+
+    slices: list[ImageSlice] = []
+    stem = Path(file_name).stem
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        image.load()
+        for row in range(1, rows + 1):
+            y0 = max(content_box.y0, y_edges[row - 1] - y_overlap)
+            y1 = min(content_box.y1, y_edges[row] + y_overlap)
+            for col in range(1, cols + 1):
+                x0 = max(content_box.x0, x_edges[col - 1] - x_overlap)
+                x1 = min(content_box.x1, x_edges[col] + x_overlap)
+                crop = image.crop((x0, y0, x1, y1))
+                slices.append(
+                    ImageSlice(
+                        file_name=f"{stem}_content_r{row:03d}_c{col:03d}.jpg",
+                        image_bytes=_encode_jpeg(crop, jpeg_quality),
+                        x0=x0,
+                        x1=x1,
+                        y0=y0,
+                        y1=y1,
+                        width=x1 - x0,
+                        height=y1 - y0,
+                        row=row,
+                        col=col,
+                        rows=rows,
+                        cols=cols,
+                    )
+                )
+    return slices
 
 
 def make_grid_slices(
@@ -236,6 +354,10 @@ def _axis_ranges(
         if end >= length:
             break
     return ranges
+
+
+def _even_edges(start: int, end: int, parts: int) -> list[int]:
+    return [start + round((end - start) * index / parts) for index in range(parts + 1)]
 
 
 def _unique_positive_ints(values: Iterable[int]) -> tuple[int, ...]:

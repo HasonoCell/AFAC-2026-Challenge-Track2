@@ -11,7 +11,13 @@ from typing import Iterable
 
 from .api import FinixDocClient, FinixDocError, normalize_markdown_payload
 from .datasets import ImageRecord
-from .images import DEFAULT_CROP_ANCHORS, ImageSlice, make_anchor_crops, make_vertical_slices
+from .images import (
+    DEFAULT_CROP_ANCHORS,
+    ImageSlice,
+    make_anchor_crops,
+    make_content_grid_slices,
+    make_vertical_slices,
+)
 from .pipeline import _merge_sliced_markdown, write_errors, write_submission
 
 
@@ -32,6 +38,15 @@ class BaselineConfig:
     retries: int = 0
     retry_sleep_seconds: float = 60.0
     min_chars: int = 20
+    table_repair_min_chars: int = 0
+    table_repair_min_gain: int = 300
+    table_repair_rows: int = 4
+    table_repair_cols: int = 4
+    table_repair_overlap: int = 120
+    table_repair_content_threshold: int = 245
+    table_repair_content_scale: float = 0.04
+    table_repair_content_padding: int = 200
+    table_repair_min_success_parts: int = 4
     long_slice_height: int = 12000
     long_slice_overlap: int = 400
     long_min_chars: int = 20
@@ -194,6 +209,15 @@ def _call_table_record(
                 f"  selected {crop.file_name} "
                 f"x={crop.x0}:{crop.x1} y={crop.y0}:{crop.y1} chars={len(markdown)}"
             )
+            repaired = _maybe_repair_short_table(
+                client=client,
+                record=record,
+                config=config,
+                markdown=markdown,
+            )
+            if repaired is not None:
+                repaired_markdown, repair_calls = repaired
+                return repaired_markdown, calls + repair_calls
             return markdown, calls
         except Exception as exc:
             errors.append(f"{crop.file_name}: {type(exc).__name__}: {exc}")
@@ -201,10 +225,135 @@ def _call_table_record(
             if config.sleep_seconds > 0:
                 time.sleep(config.sleep_seconds)
 
+    if config.table_repair_min_chars > 0:
+        try:
+            repaired_markdown, repair_calls = _call_table_content_grid_record(
+                client,
+                record,
+                config,
+                previous_markdown="",
+            )
+            return repaired_markdown, calls + repair_calls
+        except Exception as exc:
+            errors.append(f"content grid repair: {type(exc).__name__}: {exc}")
+            print(f"  content grid repair failed {record.file_name}: {type(exc).__name__}: {exc}")
+
     raise FinixDocError(
         "all baseline crop candidates failed; last errors: "
         + " | ".join(errors[-3:])
     )
+
+
+def _maybe_repair_short_table(
+    *,
+    client: FinixDocClient,
+    record: ImageRecord,
+    config: BaselineConfig,
+    markdown: str,
+) -> tuple[str, int] | None:
+    if config.table_repair_min_chars <= 0:
+        return None
+    if len(markdown.strip()) >= config.table_repair_min_chars:
+        return None
+
+    try:
+        repaired_markdown, calls = _call_table_content_grid_record(
+            client,
+            record,
+            config,
+            previous_markdown=markdown,
+        )
+    except Exception as exc:
+        print(
+            f"  content grid repair failed {record.file_name}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return None
+    if len(repaired_markdown) < len(markdown) + config.table_repair_min_gain:
+        print(
+            f"  kept crop result after content grid repair "
+            f"old_chars={len(markdown)} new_chars={len(repaired_markdown)}"
+        )
+        return markdown, calls
+    return repaired_markdown, calls
+
+
+def _call_table_content_grid_record(
+    client: FinixDocClient,
+    record: ImageRecord,
+    config: BaselineConfig,
+    *,
+    previous_markdown: str,
+) -> tuple[str, int]:
+    slices = make_content_grid_slices(
+        file_name=record.file_name,
+        image_bytes=record.read_bytes(),
+        rows=config.table_repair_rows,
+        cols=config.table_repair_cols,
+        threshold=config.table_repair_content_threshold,
+        sample_scale=config.table_repair_content_scale,
+        padding=config.table_repair_content_padding,
+        x_overlap=config.table_repair_overlap,
+        y_overlap=config.table_repair_overlap,
+        jpeg_quality=config.jpeg_quality,
+    )
+    print(
+        f"  trying content grid repair {record.file_name}: "
+        f"{config.table_repair_rows}x{config.table_repair_cols} "
+        f"threshold={config.table_repair_content_threshold}"
+    )
+
+    parts: list[str] = []
+    errors: list[str] = []
+    calls = 0
+    for image_slice in slices:
+        try:
+            calls += 1
+            markdown = _call_with_retries(
+                client,
+                image_slice,
+                config,
+                allow_unclosed_fence=True,
+                balance_html_tables=True,
+            )
+            issue = _candidate_issue(markdown, config, min_chars=10)
+            if issue:
+                raise FinixDocError(issue)
+            print(
+                f"    repaired {image_slice.file_name} "
+                f"row={image_slice.row}/{image_slice.rows} "
+                f"col={image_slice.col}/{image_slice.cols} "
+                f"chars={len(markdown)}"
+            )
+            parts.append(markdown)
+        except Exception as exc:
+            errors.append(f"{image_slice.file_name}: {type(exc).__name__}: {exc}")
+            print(f"    grid slice failed {image_slice.file_name}: {type(exc).__name__}: {exc}")
+            parts.append("")
+            if config.sleep_seconds > 0:
+                time.sleep(config.sleep_seconds)
+
+    success_parts = sum(bool(part.strip()) for part in parts)
+    if success_parts < config.table_repair_min_success_parts:
+        raise FinixDocError(
+            "content grid repair produced too few usable parts "
+            f"({success_parts}/{len(slices)}); last errors: " + " | ".join(errors[-3:])
+        )
+
+    repaired = _merge_sliced_markdown(slices, parts)
+    issue = _candidate_issue(repaired, config, min_chars=config.min_chars)
+    if issue:
+        raise FinixDocError(f"content grid repair result is invalid: {issue}")
+    if len(repaired.strip()) <= len(previous_markdown.strip()):
+        raise FinixDocError(
+            "content grid repair did not improve output length "
+            f"({len(repaired.strip())} <= {len(previous_markdown.strip())})"
+        )
+    print(
+        f"  selected content grid repair {record.file_name} "
+        f"success_parts={success_parts}/{len(slices)} chars={len(repaired)}"
+    )
+    return repaired, calls
 
 
 def _call_long_record(
@@ -264,10 +413,20 @@ def _call_with_retries(
     client: FinixDocClient,
     crop: ImageSlice,
     config: BaselineConfig,
+    *,
+    allow_unclosed_fence: bool = False,
+    balance_html_tables: bool = False,
 ) -> str:
     attempt = 0
     while True:
         try:
+            if allow_unclosed_fence or balance_html_tables:
+                return client.call_with_file(
+                    crop.file_name,
+                    crop.image_bytes,
+                    allow_unclosed_fence=allow_unclosed_fence,
+                    balance_html_tables=balance_html_tables,
+                )
             return client.call_with_file(crop.file_name, crop.image_bytes)
         except Exception:
             attempt += 1

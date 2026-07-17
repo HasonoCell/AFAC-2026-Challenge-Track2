@@ -24,7 +24,7 @@ class _FakeClient:
         self.malformed_first = malformed_first
         self.short_first = short_first
 
-    def call_with_file(self, file_name: str, file_bytes: bytes) -> str:
+    def call_with_file(self, file_name: str, file_bytes: bytes, **kwargs: object) -> str:
         self.calls.append(file_name)
         if self.fail_first and len(self.calls) == 1:
             raise RuntimeError("first crop failed")
@@ -32,6 +32,8 @@ class _FakeClient:
             return "<table>"
         if self.short_first and len(self.calls) == 1:
             return "too short"
+        if "_content_" in file_name:
+            return "<table><tr><td>repair result with enough content</td></tr></table>\n"
         if "_part" in file_name:
             return f"# {file_name}\n\nslice text\n"
         return "<table><tr><td>ok</td></tr></table>\n"
@@ -197,6 +199,42 @@ class BaselineSubmissionTest(unittest.TestCase):
             with output_csv.open(newline="", encoding="utf-8") as file:
                 rows = list(csv.DictReader(file))
             self.assertIn("sample_part003.jpg", rows[0]["ground_truth"])
+
+    def test_short_table_output_triggers_content_grid_repair(self) -> None:
+        record = _record(
+            "sample.jpg",
+            source="data/raw/AFAC A榜评测数据集(2)/finix_huge_table_rest_A/images/sample.jpg",
+        )
+        client = _FakeClient(short_first=True)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_csv = root / "submission.csv"
+            stats = run_baseline_submission(
+                records=[record],
+                client=client,
+                config=BaselineConfig(
+                    output_csv=output_csv,
+                    cache_dir=root / "cache",
+                    crop_sizes=(80,),
+                    anchors=("top_left",),
+                    min_chars=1,
+                    table_repair_min_chars=20,
+                    table_repair_min_gain=0,
+                    table_repair_rows=1,
+                    table_repair_cols=1,
+                    table_repair_min_success_parts=1,
+                ),
+            )
+
+            self.assertEqual(stats.api_calls, 2)
+            self.assertEqual(client.calls, [
+                "sample_crop_top_left_80.jpg",
+                "sample_content_r001_c001.jpg",
+            ])
+            with output_csv.open(newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+            self.assertIn("repair result with enough content", rows[0]["ground_truth"])
 
 
 def _record(

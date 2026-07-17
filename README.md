@@ -2,9 +2,9 @@
 
 本项目用于参加 AFAC 2026 挑战组赛题二，并作为“机器学习综合实践”课程项目。目标是把复杂金融文档图片解析为高保真 Markdown，最终生成比赛要求的 `file_name,ground_truth` 两列提交文件。
 
-当前版本为 `v0.1.0`：数据读取、FinixDoc-VL API 调用、参数隔离缓存、重试、CSV 生成链路、基础二维网格切片，以及 Markdown/HTML 表格的保守重建已经完成；HTML 表格已支持 `rowspan`、`colspan` 和多级表头展开。针对低置信度分块、表头/关键列复用和复杂切片合并的结构化重建仍在开发中，暂不建议直接消耗额度运行完整 A 榜数据。
+当前工程已经完成一个可上榜 baseline：A 榜 CSV 可以稳定生成并通过本地校验，线上成绩为 `50.209198`。实现包含数据读取、FinixDoc-VL API 调用、参数隔离缓存、重试、CSV 生成链路、长文档纵向分片、表格短输出的内容区域网格修复，以及 Markdown/HTML 表格的保守重建。
 
-下一版本的核心验收目标：生成一份可上传到天池提交页的正式 A 榜 CSV，文件小于 100MB，并在排行榜上获得实际分数和排名。当前提交次数有限，正式提交前必须先通过本地校验。
+下一阶段的核心目标：在保持 100 行完整提交和可复现运行的前提下，提高表格结构还原质量，重点优化超宽、超密集现金价值表的行列顺序、表头复用和重复区域去重。
 
 详细完成情况和后续计划见 [docs/Plan.md](docs/Plan.md)。
 
@@ -66,9 +66,9 @@ uv run afac inspect-data
 
 当前本地数据检查结果：
 
-- 训练集：100 张图片、100 份 Markdown 标注、100 条映射记录。
-- A 榜：50 张图片。
-- 模拟提交：100 行，其中 50 个文件名与当前 A 榜图片匹配。
+- 训练集：200 张图片、200 份 Markdown 标注、200 条映射记录。
+- A 榜：100 张图片。
+- 模拟提交：100 行，文件名与当前 A 榜图片完全匹配。
 
 一般无需解压即可预测。如需查看原图和标注：
 
@@ -132,8 +132,13 @@ finixE5005
 uv run python -m unittest discover -s tests -v
 ```
 
-当前覆盖 API 嵌套响应解析、普通 Markdown、截断响应拒绝，以及缩放后图片上传字节的回归测试。
-同时覆盖二维切片坐标、横向切片命名、Markdown/HTML 表格解析、HTML `rowspan`/`colspan` 展开、多级表头扁平化、横向拼列、纵向拼行、重叠去重、参数隔离缓存，以及预测流水线的表格重建集成测试。
+当前有 36 个测试，覆盖 API 嵌套响应解析、普通 Markdown、截断响应拒绝、宽松 fence 修复、内容区域检测、二维切片坐标、横向切片命名、Markdown/HTML 表格解析、HTML `rowspan`/`colspan` 展开、多级表头扁平化、横向拼列、纵向拼行、重叠去重、参数隔离缓存，以及预测流水线和 baseline 表格修复路径。
+
+如果需要使用 `pytest`：
+
+```bash
+uv run --with pytest python -m pytest
+```
 
 ## 提交前校验
 
@@ -147,15 +152,15 @@ uv run afac validate-submission --submission-csv outputs/submission.csv
 
 - CSV 表头必须精确为 `file_name,ground_truth`。
 - 文件大小必须小于 100MB。
-- 文件名必须覆盖当前 A 榜 50 张图片，不能缺失、重复或混入未知文件。
+- 文件名必须覆盖当前 A 榜 100 张图片，不能缺失、重复或混入未知文件。
 - `ground_truth` 不能为空，不能包含 dry-run 占位内容或 `ERROR:` 标记。
 - 明显截断的 Markdown fence 和未闭合 HTML table 会被拦截。
 
 如果决定先提交一份部分空结果用于试探平台格式，可以显式加 `--allow-empty`，但这会消耗提交次数，不建议作为默认流程。
 
-## 首次上榜 Baseline
+## 当前上榜 Baseline
 
-为了先拿到一次真实排行榜分数，可以运行低调用量 baseline。它会对每张 A 榜图片尝试若干个原始分辨率小裁片，使用第一个真实 API 成功返回的结果作为该图片的提交内容。
+当前推荐使用 `baseline-submit` 生成 A 榜提交。它会对长文档使用全页纵向分片；对表格页先尝试低调用量 anchor crop，如果输出过短或 crop 全部失败，则自动检测内容区域并进行网格切片修复。
 
 先小批量试跑：
 
@@ -174,6 +179,10 @@ uv run afac baseline-submit \
   --dataset a \
   --user-id finixB2002 \
   --on-error placeholder \
+  --long-slice-height 12000 \
+  --long-slice-overlap 400 \
+  --table-repair-min-chars 100 \
+  --table-repair-grid 4x4 \
   --output-csv outputs/submission.csv
 
 uv run afac validate-submission --submission-csv outputs/submission.csv
@@ -189,4 +198,4 @@ A 榜样本包含超宽、超密集费率表：
 - 保留较高分辨率时输出表格过长，模型响应可能截断。
 - 单纯纵向切片仍保留过多列，并会破坏表格上下文。
 
-因此当前工程链路可以运行，并能对 Markdown/HTML 表格进行保守重建；但还不能稳定生成比赛级完整提交。下一阶段将继续增强表头与关键列复用、低置信度分块诊断，以及复杂切片场景下的行列级重建。
+当前 baseline 已能稳定生成完整提交，但表格结构还原仍是主要失分点。下一阶段将继续增强表头与关键列复用、低置信度分块诊断，以及复杂切片场景下的行列级重建。

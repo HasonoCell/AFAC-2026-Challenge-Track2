@@ -41,7 +41,14 @@ class FinixDocClient:
             allowed = ", ".join(sorted(ALLOWED_USER_IDS))
             raise ValueError(f"Invalid userId {self.user_id!r}. Allowed values: {allowed}")
 
-    def call_with_file(self, file_name: str, file_bytes: bytes) -> str:
+    def call_with_file(
+        self,
+        file_name: str,
+        file_bytes: bytes,
+        *,
+        allow_unclosed_fence: bool = False,
+        balance_html_tables: bool = False,
+    ) -> str:
         body, content_type = _build_multipart_body(
             fields={
                 "userId": self.user_id,
@@ -77,7 +84,11 @@ class FinixDocClient:
         except urllib.error.URLError as exc:
             raise FinixDocError(f"Failed to call FinixDoc-VL: {exc}") from exc
 
-        markdown = _extract_markdown(response_text)
+        markdown = _extract_markdown(
+            response_text,
+            allow_unclosed_fence=allow_unclosed_fence,
+            balance_html_tables=balance_html_tables,
+        )
         if not markdown.strip():
             raise FinixDocError(f"FinixDoc-VL returned an empty result for {file_name}")
         return markdown
@@ -127,7 +138,12 @@ def _build_multipart_body(
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
-def _extract_markdown(response_text: str) -> str:
+def _extract_markdown(
+    response_text: str,
+    *,
+    allow_unclosed_fence: bool = False,
+    balance_html_tables: bool = False,
+) -> str:
     try:
         payload = json.loads(response_text)
     except json.JSONDecodeError:
@@ -145,7 +161,11 @@ def _extract_markdown(response_text: str) -> str:
     extracted = _find_markdown_value(payload)
     if extracted is None:
         return json.dumps(payload, ensure_ascii=False, indent=2)
-    return _clean_markdown(extracted)
+    return _clean_markdown(
+        extracted,
+        allow_unclosed_fence=allow_unclosed_fence,
+        balance_html_tables=balance_html_tables,
+    )
 
 
 def _find_markdown_value(value: Any) -> str | None:
@@ -191,21 +211,43 @@ def _find_markdown_value(value: Any) -> str | None:
     return None
 
 
-def normalize_markdown_payload(text: str) -> str:
+def normalize_markdown_payload(
+    text: str,
+    *,
+    allow_unclosed_fence: bool = False,
+    balance_html_tables: bool = False,
+) -> str:
     """Normalize API responses accidentally persisted as cache content."""
-    return _extract_markdown(text)
+    return _extract_markdown(
+        text,
+        allow_unclosed_fence=allow_unclosed_fence,
+        balance_html_tables=balance_html_tables,
+    )
 
 
-def _clean_markdown(text: str) -> str:
+def _clean_markdown(
+    text: str,
+    *,
+    allow_unclosed_fence: bool = False,
+    balance_html_tables: bool = False,
+) -> str:
     stripped = text.strip()
     if stripped.startswith("```"):
         first_newline = stripped.find("\n")
         if first_newline == -1:
             raise FinixDocError("FinixDoc-VL returned an incomplete fenced response.")
         if not stripped.endswith("```"):
-            raise FinixDocError(
-                "FinixDoc-VL response appears truncated because its Markdown "
-                "code fence is not closed. Use a smaller --slice-height."
-            )
-        stripped = stripped[first_newline + 1 : -3].strip()
+            if not allow_unclosed_fence:
+                raise FinixDocError(
+                    "FinixDoc-VL response appears truncated because its Markdown "
+                    "code fence is not closed. Use a smaller --slice-height."
+                )
+            stripped = stripped[first_newline + 1 :].strip()
+        else:
+            stripped = stripped[first_newline + 1 : -3].strip()
+    if balance_html_tables:
+        lowered = stripped.lower()
+        missing_closes = lowered.count("<table") - lowered.count("</table>")
+        if missing_closes > 0:
+            stripped = stripped.rstrip() + "\n" + "\n".join("</table>" for _ in range(missing_closes))
     return stripped + "\n"

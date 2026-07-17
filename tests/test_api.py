@@ -45,6 +45,25 @@ class NormalizeMarkdownPayloadTest(unittest.TestCase):
         with self.assertRaisesRegex(FinixDocError, "appears truncated"):
             normalize_markdown_payload(json.dumps(chat_completion))
 
+    def test_can_leniently_keep_unclosed_fence_and_balance_tables(self) -> None:
+        chat_completion = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "```markdown\n<table><tr><td>ok</td></tr>",
+                    }
+                }
+            ]
+        }
+
+        actual = normalize_markdown_payload(
+            json.dumps(chat_completion),
+            allow_unclosed_fence=True,
+            balance_html_tables=True,
+        )
+
+        self.assertEqual(actual, "<table><tr><td>ok</td></tr>\n</table>\n")
+
 
 if __name__ == "__main__":
     unittest.main()
