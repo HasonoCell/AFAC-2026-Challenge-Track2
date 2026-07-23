@@ -136,6 +136,44 @@ def table_to_markdown(table: MarkdownTable) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def retain_complete_pipe_table_rows(text: str, *, max_bytes: int) -> str:
+    """Fit one trailing pipe table into a UTF-8 budget without malformed rows."""
+
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+    if len(text.encode("utf-8")) <= max_bytes:
+        return text
+    lines = text.splitlines(keepends=True)
+    table_start = next(
+        (
+            index
+            for index in range(len(lines) - 1)
+            if "|" in lines[index] and _is_separator_line(lines[index + 1].strip())
+        ),
+        None,
+    )
+    if table_start is None:
+        raise ValueError("oversized output has no pipe table")
+    prefix = "".join(lines[:table_start])
+    table = parse_markdown_pipe_table("".join(lines[table_start:]))
+    if table is None:
+        raise ValueError("oversized output is not one complete trailing pipe table")
+    retained: list[tuple[str, ...]] = []
+    for row in table.rows:
+        candidate = prefix + table_to_markdown(
+            MarkdownTable(header=table.header, rows=tuple((*retained, row)))
+        )
+        if len(candidate.encode("utf-8")) > max_bytes:
+            break
+        retained.append(row)
+    compact = prefix + table_to_markdown(
+        MarkdownTable(header=table.header, rows=tuple(retained))
+    )
+    if len(compact.encode("utf-8")) > max_bytes or not retained:
+        raise ValueError("table header cannot fit the requested byte budget")
+    return compact
+
+
 def table_to_html(table: MarkdownTable) -> str:
     if table.source_html is not None:
         return table.source_html

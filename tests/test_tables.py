@@ -10,6 +10,7 @@ from afac_pipeline.tables import (
     parse_sliced_table,
     table_to_html,
     table_to_markdown,
+    retain_complete_pipe_table_rows,
     try_reconstruct_grid_table_bands_html,
     try_reconstruct_grid_tables,
     try_reconstruct_grid_tables_html,
@@ -34,6 +35,13 @@ def _slice(row: int, col: int, rows: int, cols: int) -> ImageSlice:
 
 
 class MarkdownTableTest(unittest.TestCase):
+    def test_row_budget_keeps_header_and_complete_rows(self) -> None:
+        source = "标题\n| A | B |\n| --- | --- |\n| 一 | 二 |\n| 三 | 四 |\n"
+        compact = retain_complete_pipe_table_rows(
+            source,
+            max_bytes=len("标题\n| A | B |\n| --- | --- |\n| 一 | 二 |\n".encode()),
+        )
+        self.assertEqual(compact, "标题\n| A | B |\n| --- | --- |\n| 一 | 二 |\n")
     def test_html_conversion_preserves_expanded_grid(self) -> None:
         converted = html_tables_to_markdown(
             '<table><tr><th rowspan="2">A</th><th colspan="2">B</th></tr>'

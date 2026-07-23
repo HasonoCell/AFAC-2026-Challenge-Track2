@@ -101,6 +101,9 @@ def apply_baseline_preset(config: BaselineConfig, preset: str) -> BaselineConfig
         table_local_ocr_workers=4,
         table_local_ocr_refine_saturated=(preset == B_GENERALIZATION_V3),
         table_local_ocr_max_refine_depth=1,
+        table_local_ocr_max_output_bytes=(
+            190_000 if preset == B_GENERALIZATION_V6 else 0
+        ),
         table_refine_max_depth=0,
         long_slice_height=12_000,
         long_slice_overlap=400,

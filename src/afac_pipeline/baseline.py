@@ -38,7 +38,7 @@ from .local_ocr import (
 from .merge import merge_sliced_markdown
 from .pipeline import write_errors, write_submission
 from .submission import _read_submission_rows
-from .tables import html_tables_to_markdown, parse_table
+from .tables import html_tables_to_markdown, parse_table, retain_complete_pipe_table_rows
 from .vision import render_observations_in_reading_order
 
 
@@ -100,6 +100,7 @@ class BaselineConfig:
     table_local_ocr_workers: int = 4
     table_local_ocr_refine_saturated: bool = False
     table_local_ocr_max_refine_depth: int = 1
+    table_local_ocr_max_output_bytes: int = 0
     table_anchor_max_candidates: int = 1
     table_anchor_max_attempts: int = 0
     table_mode: str = 'coverage'
@@ -233,6 +234,8 @@ def run_baseline_submission(
         raise ValueError("table_local_ocr_workers must be >= 1")
     if config.table_local_ocr_max_refine_depth < 0:
         raise ValueError("table_local_ocr_max_refine_depth must be >= 0")
+    if config.table_local_ocr_max_output_bytes < 0:
+        raise ValueError("table_local_ocr_max_output_bytes must be >= 0")
     if config.long_low_confidence_char_density < 0:
         raise ValueError("long_low_confidence_char_density must be >= 0")
     if config.long_fallback_slice_height < 0:
@@ -452,7 +455,8 @@ def rebuild_cached_local_matrix_repairs(
             continue
         if result is None:
             continue
-        issue = _table_candidate_issue(result.markdown, config)
+        candidate_markdown = _local_matrix_candidate_markdown(result.markdown, config)
+        issue = _table_candidate_issue(candidate_markdown, config)
         if issue is not None:
             print(
                 f"  cached local matrix rebuild rejected {record.file_name}: {issue}"
@@ -461,7 +465,7 @@ def rebuild_cached_local_matrix_repairs(
         base_markdown = base[record.file_name]
         if not _repair_is_better(
             base_markdown,
-            result.markdown,
+            candidate_markdown,
             config.table_repair_min_gain,
             max_duplicate_line_ratio=config.table_max_duplicate_line_ratio,
         ):
@@ -469,13 +473,13 @@ def rebuild_cached_local_matrix_repairs(
         selected_rows.append(
             {
                 "file_name": record.file_name,
-                "ground_truth": _serialize_output_tables(result.markdown, config),
+                "ground_truth": candidate_markdown,
             }
         )
         print(
             f"  selected cached local matrix rebuild {record.file_name}: "
             f"rows={result.rows} cols={result.cols} coverage={result.coverage:.3f} "
-            f"chars={len(result.markdown)}"
+            f"chars={len(candidate_markdown)}"
         )
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -781,7 +785,8 @@ def _maybe_local_matrix_repair(
             f"{record.file_name}"
         )
         return None
-    issue = _table_candidate_issue(result.markdown, config)
+    candidate_markdown = _local_matrix_candidate_markdown(result.markdown, config)
+    issue = _table_candidate_issue(candidate_markdown, config)
     if issue is not None:
         print(
             f"  local {config.table_local_ocr_backend} matrix route rejected "
@@ -790,7 +795,7 @@ def _maybe_local_matrix_repair(
         return None
     if not _repair_is_better(
         previous_markdown,
-        result.markdown,
+        candidate_markdown,
         config.table_repair_min_gain,
         max_duplicate_line_ratio=config.table_max_duplicate_line_ratio,
     ):
@@ -799,9 +804,9 @@ def _maybe_local_matrix_repair(
         f"  selected local {config.table_local_ocr_backend} matrix repair "
         f"{record.file_name}: "
         f"tables={result.table_count} rows={result.rows} cols={result.cols} "
-        f"coverage={result.coverage:.3f} chars={len(result.markdown)}"
+        f"coverage={result.coverage:.3f} chars={len(candidate_markdown)}"
     )
-    return result.markdown
+    return candidate_markdown
 
 
 def _call_table_content_grid_record(
@@ -2015,6 +2020,18 @@ def _serialize_output_tables(markdown: str, config: BaselineConfig) -> str:
     if config.table_output_format == "html":
         return markdown
     return html_tables_to_markdown(markdown)
+
+
+def _local_matrix_candidate_markdown(markdown: str, config: BaselineConfig) -> str:
+    """Canonicalize, then budget only a structurally validated local table."""
+
+    candidate = _serialize_output_tables(markdown, config)
+    if config.table_local_ocr_max_output_bytes:
+        candidate = retain_complete_pipe_table_rows(
+            candidate,
+            max_bytes=config.table_local_ocr_max_output_bytes,
+        )
+    return candidate
 
 
 def _build_output_rows(
