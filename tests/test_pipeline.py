@@ -9,7 +9,16 @@ from pathlib import Path
 from PIL import Image
 
 from afac_pipeline.datasets import ImageRecord
-from afac_pipeline.pipeline import PredictionConfig, run_prediction
+from afac_pipeline.merge import (
+    coalesce_adjacent_html_tables,
+    merge_sliced_markdown,
+    merge_markdown_parts_legacy,
+)
+from afac_pipeline.images import ImageSlice
+from afac_pipeline.pipeline import (
+    PredictionConfig,
+    run_prediction,
+)
 
 
 class _FakeClient:
@@ -31,6 +40,83 @@ class _CountingClient:
 
 
 class PredictionPipelineTest(unittest.TestCase):
+    def test_legacy_vertical_merge_removes_line_overlap(self) -> None:
+        self.assertEqual(
+            merge_markdown_parts_legacy(["title\nbody\n", "body\nnext\n"]),
+            "title\nbody\nnext\n",
+        )
+
+    def test_coalesces_only_adjacent_same_width_html_tables(self) -> None:
+        first = (
+            '<table><tr><td rowspan="2">第1组：A</td><td>B</td></tr>'
+            '<tr><td>C</td></tr></table>'
+        )
+        second = '<table><tr><td>第2组：D</td><td>E</td></tr></table>'
+
+        merged = coalesce_adjacent_html_tables(first + "\n\n" + second)
+
+        self.assertEqual(merged.lower().count('<table'), 1)
+        self.assertIn('rowspan="2"', merged)
+        self.assertLess(merged.index('>C<'), merged.index('第2组：D'))
+
+    def test_html_table_merge_preserves_plain_edge_slices(self) -> None:
+        slices = [
+            ImageSlice(
+                file_name=f"part{index}.jpg",
+                image_bytes=b"",
+                x0=0,
+                x1=1,
+                y0=index,
+                y1=index + 1,
+                width=1,
+                height=1,
+                row=index + 1,
+                col=1,
+                rows=3,
+                cols=1,
+            )
+            for index in range(3)
+        ]
+        parts = [
+            "# Leading title\n\nprose before the table",
+            "<table><tr><td>A</td></tr></table>",
+            "prose after the table",
+        ]
+
+        merged = merge_sliced_markdown(slices, parts)
+
+        self.assertIn("# Leading title", merged)
+        self.assertIn("prose before the table", merged)
+        self.assertIn("<td>A</td>", merged)
+        self.assertIn("prose after the table", merged)
+        self.assertLess(merged.index("prose before"), merged.index("<td>A"))
+        self.assertLess(merged.index("<td>A"), merged.index("prose after"))
+
+    def test_keeps_adjacent_tables_separate_when_prose_or_width_differs(self) -> None:
+        two_columns = '<table><tr><td>第1组：A</td><td>B</td></tr></table>'
+        next_two_columns = '<table><tr><td>第2组：C</td><td>D</td></tr></table>'
+        three_columns = (
+            '<table><tr><td>第2组：C</td><td>D</td><td>E</td></tr></table>'
+        )
+
+        with_heading = coalesce_adjacent_html_tables(
+            two_columns + '\n## Next table\n' + next_two_columns
+        )
+        different_width = coalesce_adjacent_html_tables(
+            two_columns + '\n' + three_columns
+        )
+
+        self.assertEqual(with_heading.lower().count('<table'), 2)
+        self.assertEqual(different_width.lower().count('<table'), 2)
+
+    def test_keeps_unnumbered_adjacent_same_width_tables_separate(self) -> None:
+        basic = '<table><tr><td>基本部分</td><td>A</td></tr></table>'
+        optional = '<table><tr><td>可选部分</td><td>B</td></tr></table>'
+
+        merged = coalesce_adjacent_html_tables(basic + '\n' + optional)
+
+        self.assertEqual(merged.lower().count('<table'), 2)
+
     def test_run_prediction_reconstructs_horizontal_tables(self) -> None:
         original = io.BytesIO()
         Image.new("RGB", (200, 80), "white").save(original, format="JPEG", quality=95)

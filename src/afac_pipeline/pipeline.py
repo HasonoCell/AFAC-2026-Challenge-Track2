@@ -12,11 +12,11 @@ from typing import Iterable
 
 from .api import FinixDocClient, FinixDocError, normalize_markdown_payload
 from .datasets import ImageRecord
-from .images import ImageSlice, make_grid_slices
-from .tables import try_reconstruct_grid_tables
+from .images import make_grid_slices
+from .merge import merge_sliced_markdown
 
 
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -197,7 +197,7 @@ def _call_record(
         parts.append(_call_with_retries(client, image_slice.file_name, image_slice.image_bytes, config))
         if config.sleep_seconds > 0 and slice_index < len(slices):
             time.sleep(config.sleep_seconds)
-    return _merge_sliced_markdown(slices, parts), len(slices)
+    return merge_sliced_markdown(slices, parts), len(slices)
 
 
 def _call_with_retries(
@@ -210,78 +210,19 @@ def _call_with_retries(
     while True:
         try:
             return client.call_with_file(file_name, image_bytes)
-        except Exception:
+        except Exception as exc:
             attempt += 1
             if attempt > config.retries:
                 raise
+            delay_seconds = config.retry_sleep_seconds
+            if "HTTP 429" in str(exc):
+                delay_seconds *= 2 ** (attempt - 1)
             print(
                 f"  retry {attempt}/{config.retries} after "
-                f"{config.retry_sleep_seconds:.0f}s: {file_name}"
+                f"{delay_seconds:.0f}s: {file_name} "
+                f"({type(exc).__name__}: {exc})"
             )
-            time.sleep(config.retry_sleep_seconds)
-
-
-def _merge_markdown_parts(parts: list[str]) -> str:
-    if not parts:
-        return ""
-
-    merged_lines = _strip_edge_blank_lines(parts[0].splitlines())
-    for part in parts[1:]:
-        next_lines = _strip_edge_blank_lines(part.splitlines())
-        overlap = _line_overlap(merged_lines, next_lines, max_lines=30)
-        merged_lines.extend(next_lines[overlap:])
-    return "\n".join(merged_lines).strip() + "\n"
-
-
-def _merge_sliced_markdown(slices: list[ImageSlice], parts: list[str]) -> str:
-    if not slices or not parts:
-        return ""
-    reconstructed = try_reconstruct_grid_tables(slices, parts)
-    if reconstructed is not None:
-        return reconstructed
-    if len(slices) == 1 or all(image_slice.cols == 1 for image_slice in slices):
-        return _merge_markdown_parts(parts)
-
-    # Horizontal/grid slices cannot be faithfully merged by line overlap alone.
-    # Keep deterministic row-major order and embed lightweight HTML comments so
-    # the output remains traceable until the table-reconstruction milestone is
-    # implemented.
-    annotated_parts: list[str] = []
-    for image_slice, part in zip(slices, parts, strict=True):
-        annotated_parts.append(
-            "\n".join(
-                [
-                    (
-                        "<!-- "
-                        f"slice row={image_slice.row}/{image_slice.rows} "
-                        f"col={image_slice.col}/{image_slice.cols} "
-                        f"x={image_slice.x0}:{image_slice.x1} "
-                        f"y={image_slice.y0}:{image_slice.y1} "
-                        "-->"
-                    ),
-                    part.strip(),
-                ]
-            )
-        )
-    return "\n\n".join(annotated_parts).strip() + "\n"
-
-
-def _strip_edge_blank_lines(lines: list[str]) -> list[str]:
-    start = 0
-    end = len(lines)
-    while start < end and not lines[start].strip():
-        start += 1
-    while end > start and not lines[end - 1].strip():
-        end -= 1
-    return lines[start:end]
-
-
-def _line_overlap(left: list[str], right: list[str], max_lines: int) -> int:
-    limit = min(max_lines, len(left), len(right))
-    for size in range(limit, 0, -1):
-        if left[-size:] == right[:size]:
-            return size
-    return 0
+            time.sleep(delay_seconds)
 
 
 def _cache_dir_for_config(config: PredictionConfig) -> Path:

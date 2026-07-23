@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
 import secrets
 import ssl
+import threading
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import certifi
@@ -27,6 +29,123 @@ ALLOWED_USER_IDS = {
 
 class FinixDocError(RuntimeError):
     """Raised when FinixDoc-VL returns an unusable response."""
+
+
+_TABLE_STRUCTURE_TAG = re.compile(
+    r"<\s*(/?)\s*(table|tr|td|th)(?:\s[^<>]*)?>",
+    flags=re.IGNORECASE,
+)
+
+
+def html_table_structure_issue(text: str) -> str | None:
+    """Return a concise error for explicitly malformed table markup.
+
+    Table results written by this pipeline use explicit close tags. Counting
+    only ``<table>`` tags lets an unclosed row or cell reach a downstream CSV
+    consumer, where it may abort the whole evaluation. This narrow checker
+    leaves unrelated Markdown and non-table HTML untouched.
+    """
+
+    stack: list[str] = []
+    for match in _TABLE_STRUCTURE_TAG.finditer(text):
+        closing, tag = match.group(1), match.group(2).lower()
+        if not closing:
+            stack.append(tag)
+            continue
+        if not stack:
+            return f"HTML table structure closes </{tag}> without an opening tag"
+        opening = stack.pop()
+        if opening != tag:
+            return f"HTML table structure closes </{tag}> while <{opening}> is open"
+    if stack:
+        return "HTML table structure has unclosed " + ", ".join(
+            f"<{tag}>" for tag in stack[-3:]
+        )
+    return None
+
+
+def repair_implicit_html_table_closures(text: str) -> str:
+    """Make HTML's optional cell/row end tags explicit.
+
+    The labelled corpus contains otherwise complete tables that use constructs
+    such as ``<td><td>`` or close ``</tr>`` while the final cell is still open.
+    Browsers accept those forms, but the pipeline deliberately emits explicit
+    markup before CSV validation.  This helper only inserts closures implied by
+    a following table tag; it never invents a missing ``</table>``.
+    """
+
+    output: list[str] = []
+    stack: list[str] = []
+    cursor = 0
+    for match in _TABLE_STRUCTURE_TAG.finditer(text):
+        output.append(text[cursor : match.start()])
+        closing, tag = match.group(1), match.group(2).lower()
+        if not closing:
+            if tag == "tr":
+                if stack and stack[-1] in {"td", "th"}:
+                    output.append(f"</{stack.pop()}>")
+                if stack and stack[-1] == "tr":
+                    output.append("</tr>")
+                    stack.pop()
+            elif tag in {"td", "th"} and stack and stack[-1] in {"td", "th"}:
+                output.append(f"</{stack.pop()}>")
+            output.append(match.group(0))
+            stack.append(tag)
+        else:
+            if tag == "tr" and stack and stack[-1] in {"td", "th"}:
+                output.append(f"</{stack.pop()}>")
+            elif tag == "table":
+                if stack and stack[-1] in {"td", "th"}:
+                    output.append(f"</{stack.pop()}>")
+                if stack and stack[-1] == "tr":
+                    output.append("</tr>")
+                    stack.pop()
+            output.append(match.group(0))
+            if stack and stack[-1] == tag:
+                stack.pop()
+            else:
+                # Preserve unfamiliar mismatches for the strict validator to
+                # reject; repairing arbitrary nesting could hide truncation.
+                stack.append(f"mismatch:{tag}")
+        cursor = match.end()
+    output.append(text[cursor:])
+    return "".join(output)
+
+
+@dataclass
+class RotatingFinixDocClient:
+    """Round-robin requests across official FinixDoc user IDs.
+
+    Rotation is sequential and deterministic.  It improves throughput when the
+    service enforces rate limits per whitelisted ``userId`` while preserving
+    the single-client interface used by the prediction pipeline.
+    """
+
+    clients: tuple["FinixDocClient", ...]
+    _next_index: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.clients:
+            raise ValueError("RotatingFinixDocClient requires at least one client")
+
+    def call_with_file(
+        self,
+        file_name: str,
+        file_bytes: bytes,
+        *,
+        allow_unclosed_fence: bool = False,
+        balance_html_tables: bool = False,
+    ) -> str:
+        with self._lock:
+            client = self.clients[self._next_index]
+            self._next_index = (self._next_index + 1) % len(self.clients)
+        return client.call_with_file(
+            file_name,
+            file_bytes,
+            allow_unclosed_fence=allow_unclosed_fence,
+            balance_html_tables=balance_html_tables,
+        )
 
 
 @dataclass(frozen=True)
@@ -248,6 +367,8 @@ def _clean_markdown(
     if balance_html_tables:
         lowered = stripped.lower()
         missing_closes = lowered.count("<table") - lowered.count("</table>")
+        if missing_closes == 0:
+            stripped = repair_implicit_html_table_closures(stripped)
         if missing_closes > 0:
             stripped = stripped.rstrip() + "\n" + "\n".join("</table>" for _ in range(missing_closes))
     return stripped + "\n"

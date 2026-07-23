@@ -21,6 +21,13 @@ class ImageRecord:
 
 
 @dataclass(frozen=True)
+class MarkdownRecord:
+    file_name: str
+    source: str
+    read_text: Callable[[], str]
+
+
+@dataclass(frozen=True)
 class DatasetSpec:
     name: str
     zip_glob: str
@@ -56,8 +63,19 @@ A_SPEC = DatasetSpec(
         "finix_huge_table_rest_A/images/",
     ),
 )
+B_SPEC = DatasetSpec(
+    name="b",
+    zip_glob="AFAC B榜评测数据集*.zip",
+    dir_glob="AFAC B榜评测数据集*",
+    image_prefixes=(
+        "finix_huge_long_rest_B/images/",
+        "finix_huge_table_rest_B/images/",
+    ),
+)
 MOCK_SUBMISSION_ZIP = "finix_ab_A_submit_mock.csv.zip"
 MOCK_SUBMISSION_NAME = "finix_ab_A_submit_mock.csv"
+B_MOCK_SUBMISSION_ZIP = "finix_ab_B_submit_mock.csv.zip"
+B_MOCK_SUBMISSION_NAME = "finix_ab_B_submit_mock.csv"
 
 
 def get_dataset_spec(name: str) -> DatasetSpec:
@@ -65,7 +83,9 @@ def get_dataset_spec(name: str) -> DatasetSpec:
         return TRAIN_SPEC
     if name == "a":
         return A_SPEC
-    raise ValueError(f"Unknown dataset {name!r}; expected 'train' or 'a'")
+    if name == "b":
+        return B_SPEC
+    raise ValueError(f"Unknown dataset {name!r}; expected 'train', 'a', or 'b'")
 
 
 def iter_dataset_images(raw_dir: Path, dataset: str) -> Iterator[ImageRecord]:
@@ -75,6 +95,14 @@ def iter_dataset_images(raw_dir: Path, dataset: str) -> Iterator[ImageRecord]:
         yield from _iter_dir_images(dir_roots)
         return
     yield from iter_zip_images(raw_dir, spec.zip_glob, spec.image_prefixes)
+
+
+def iter_train_markdowns(raw_dir: Path) -> Iterator[MarkdownRecord]:
+    dir_roots = _dataset_dir_roots(raw_dir, TRAIN_SPEC.dir_glob)
+    if dir_roots:
+        yield from _iter_dir_markdowns(dir_roots, TRAIN_SPEC.md_prefixes)
+        return
+    yield from iter_zip_markdowns(raw_dir, TRAIN_SPEC.zip_glob, TRAIN_SPEC.md_prefixes)
 
 
 def iter_zip_images(
@@ -111,6 +139,40 @@ def iter_zip_images(
             )
 
 
+def iter_zip_markdowns(
+    raw_dir: Path,
+    zip_glob: str,
+    md_prefixes: tuple[str, ...],
+) -> Iterator[MarkdownRecord]:
+    zip_paths = sorted(raw_dir.glob(zip_glob))
+    seen: set[str] = set()
+    for zip_path in zip_paths:
+        with zipfile.ZipFile(zip_path) as zf:
+            markdown_names = [
+                name
+                for name in zf.namelist()
+                if _is_markdown(name, md_prefixes)
+            ]
+        for member_name in sorted(markdown_names):
+            file_name = f"{Path(member_name).stem}.jpg"
+            if file_name in seen:
+                continue
+            seen.add(file_name)
+
+            def read_text(
+                zip_path: Path = zip_path,
+                member_name: str = member_name,
+            ) -> str:
+                with zipfile.ZipFile(zip_path) as zf:
+                    return zf.read(member_name).decode("utf-8")
+
+            yield MarkdownRecord(
+                file_name=file_name,
+                source=f"{zip_path.name}:{member_name}",
+                read_text=read_text,
+            )
+
+
 def iter_dir_images(input_dir: Path) -> Iterator[ImageRecord]:
     yield from _iter_dir_images([input_dir])
 
@@ -118,20 +180,24 @@ def iter_dir_images(input_dir: Path) -> Iterator[ImageRecord]:
 def inspect_raw_data(raw_dir: Path) -> dict[str, object]:
     train_zip = raw_dir / TRAIN_SPEC.zip_glob
     a_zips = sorted(raw_dir.glob(A_SPEC.zip_glob))
+    b_zips = sorted(raw_dir.glob(B_SPEC.zip_glob))
     mock_zip = raw_dir / MOCK_SUBMISSION_ZIP
     mock_csv = raw_dir / MOCK_SUBMISSION_NAME
     mock_source = mock_submission_source(raw_dir)
     train_dir_roots = _dataset_dir_roots(raw_dir, TRAIN_SPEC.dir_glob)
     a_dir_roots = _dataset_dir_roots(raw_dir, A_SPEC.dir_glob)
+    b_dir_roots = _dataset_dir_roots(raw_dir, B_SPEC.dir_glob)
 
     summary: dict[str, object] = {
         "raw_dir": str(raw_dir),
         "train_zip_exists": train_zip.exists(),
         "a_zip_files": [path.name for path in a_zips],
+        "b_zip_files": [path.name for path in b_zips],
         "mock_zip_exists": mock_zip.exists(),
         "mock_csv_exists": mock_csv.exists(),
         "train_dir_roots": [path.name for path in train_dir_roots],
         "a_dir_roots": [path.name for path in a_dir_roots],
+        "b_dir_roots": [path.name for path in b_dir_roots],
     }
     if train_zip.exists():
         summary.update(_count_zip_dataset(train_zip, TRAIN_SPEC))
@@ -142,6 +208,10 @@ def inspect_raw_data(raw_dir: Path) -> dict[str, object]:
         summary["a_images"] = len(a_images)
     elif a_dir_roots:
         summary["a_images"] = len(list(_iter_dir_images(a_dir_roots)))
+    if b_zips:
+        summary["b_images"] = len(list(iter_dataset_images(raw_dir, "b")))
+    elif b_dir_roots:
+        summary["b_images"] = len(list(_iter_dir_images(b_dir_roots)))
     if mock_source:
         mock_rows = read_mock_submission(mock_source)
         summary["mock_rows"] = len(mock_rows)
@@ -159,7 +229,14 @@ def read_mock_submission(mock_zip: Path) -> list[dict[str, str]]:
         text = mock_zip.read_text(encoding="utf-8-sig")
     else:
         with zipfile.ZipFile(mock_zip) as zf:
-            text = zf.read(MOCK_SUBMISSION_NAME).decode("utf-8-sig")
+            csv_names = sorted(
+                name
+                for name in zf.namelist()
+                if not name.endswith("/") and Path(name).suffix.lower() == ".csv"
+            )
+            if not csv_names:
+                raise ValueError(f"submission template zip has no CSV: {mock_zip}")
+            text = zf.read(csv_names[0]).decode("utf-8-sig")
     return list(csv.DictReader(io.StringIO(text)))
 
 
@@ -238,10 +315,23 @@ def _dataset_dir_roots(raw_dir: Path, dir_glob: str) -> list[Path]:
 
 
 def mock_submission_source(raw_dir: Path) -> Path | None:
-    csv_path = raw_dir / MOCK_SUBMISSION_NAME
+    return submission_template_source(raw_dir, "a")
+
+
+def submission_template_source(raw_dir: Path, dataset: str) -> Path | None:
+    if dataset == "a":
+        csv_name = MOCK_SUBMISSION_NAME
+        zip_name = MOCK_SUBMISSION_ZIP
+    elif dataset == "b":
+        csv_name = B_MOCK_SUBMISSION_NAME
+        zip_name = B_MOCK_SUBMISSION_ZIP
+    else:
+        return None
+
+    csv_path = raw_dir / csv_name
     if csv_path.exists():
         return csv_path
-    zip_path = raw_dir / MOCK_SUBMISSION_ZIP
+    zip_path = raw_dir / zip_name
     if zip_path.exists():
         return zip_path
     return None
@@ -268,6 +358,33 @@ def _iter_dir_images(dir_roots: Iterable[Path]) -> Iterator[ImageRecord]:
             file_name=file_name,
             source=str(image_path),
             read_bytes=image_path.read_bytes,
+        )
+
+
+def _iter_dir_markdowns(
+    dir_roots: Iterable[Path],
+    md_prefixes: tuple[str, ...],
+) -> Iterator[MarkdownRecord]:
+    seen: set[str] = set()
+    markdown_paths = sorted(
+        path
+        for root in dir_roots
+        for path in root.rglob("*.md")
+        if path.is_file()
+        and path.name != ".DS_Store"
+        and not path.name.startswith("._")
+        and "__MACOSX" not in path.parts
+        and _is_markdown(path.relative_to(root).as_posix(), md_prefixes)
+    )
+    for markdown_path in markdown_paths:
+        file_name = f"{markdown_path.stem}.jpg"
+        if file_name in seen:
+            continue
+        seen.add(file_name)
+        yield MarkdownRecord(
+            file_name=file_name,
+            source=str(markdown_path),
+            read_text=lambda markdown_path=markdown_path: markdown_path.read_text(encoding="utf-8"),
         )
 
 
