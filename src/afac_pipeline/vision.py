@@ -1347,6 +1347,67 @@ def _reconstruct_single_numeric_matrix(
     semantic_header: VisionObservation,
     row_start_hint: int | None = None,
 ) -> VisionMatrixResult | None:
+    """Reconstruct a regular matrix under the best justified x anchor.
+
+    RapidOCR reports bounding-box centres.  In financial tables, currency
+    cells are often right-aligned, so their centres drift by several pixels as
+    the number of digits changes even though their physical column is fixed.
+    Evaluate the three box anchors independently and select only a result
+    whose visible annual axis is plausible; this keeps the representation
+    choice local to a table instead of hard-coding one publisher's alignment.
+    """
+
+    candidates: list[VisionMatrixResult] = []
+    for anchor in ("center", "right", "left"):
+        anchored_observations = [
+            replace(item, x=_horizontal_anchor(item, anchor))
+            for item in observations
+        ]
+        anchored_header = replace(
+            semantic_header,
+            x=_horizontal_anchor(semantic_header, anchor),
+        )
+        result = _reconstruct_single_numeric_matrix_for_anchor(
+            anchored_observations,
+            semantic_header=anchored_header,
+            row_start_hint=row_start_hint,
+        )
+        if result is not None:
+            candidates.append(result)
+    if not candidates:
+        return None
+
+    def score(result: VisionMatrixResult) -> tuple[int, int, float, int]:
+        header_start = result.header_starts[0] if result.header_starts else -1
+        return (
+            int(0 <= header_start <= 254),
+            result.header_sequence_inliers,
+            result.coverage,
+            result.populated_cells,
+        )
+
+    return max(candidates, key=score)
+
+
+def _horizontal_anchor(
+    observation: VisionObservation,
+    anchor: str,
+) -> float:
+    if anchor == "center":
+        return observation.x
+    if anchor == "right":
+        return observation.x + observation.width / 2
+    if anchor == "left":
+        return observation.x - observation.width / 2
+    raise ValueError(f"unknown horizontal anchor {anchor!r}")
+
+
+def _reconstruct_single_numeric_matrix_for_anchor(
+    observations: list[VisionObservation],
+    *,
+    semantic_header: VisionObservation,
+    row_start_hint: int | None = None,
+) -> VisionMatrixResult | None:
     header_y = semantic_header.y
 
     numeric_data = [
@@ -1517,7 +1578,7 @@ def _matrix_header_candidates(
     ]
     for top_label in top_labels:
         for age_label in age_labels:
-            vertical_gap = age_label.y - top_label.y
+            vertical_gap = abs(age_label.y - top_label.y)
             max_gap = max(48.0, (top_label.height + age_label.height) * 2.5)
             alignment_limit = max(
                 24.0,
@@ -1525,7 +1586,12 @@ def _matrix_header_candidates(
             )
             if not 0 < vertical_gap <= max_gap:
                 continue
-            if abs(age_label.x - top_label.x) > alignment_limit:
+            x_offset = abs(age_label.x - top_label.x)
+            if x_offset > alignment_limit and not _has_adjacent_annual_sequence(
+                observations,
+                annual_label=top_label,
+                minimum_x=max(top_label.x, age_label.x),
+            ):
                 continue
             candidates.append(
                 VisionObservation(
@@ -1549,6 +1615,30 @@ def _matrix_header_candidates(
         (max(group, key=lambda item: item.confidence) for group in groups),
         key=lambda item: item.y,
     )
+
+
+def _has_adjacent_annual_sequence(
+    observations: list[VisionObservation],
+    *,
+    annual_label: VisionObservation,
+    minimum_x: float,
+) -> bool:
+    """Prove a diagonally offset age/year corner with visible annual labels.
+
+    The ordinary stacked-corner form keeps both labels in one narrow x band.
+    Some source tables instead print ``投保年龄`` in the next small corner
+    cell.  We accept that wider geometry only when the ``保单年度末`` row also
+    contains a sequential `1..5` annual axis to its right.
+    """
+
+    band = max(16.0, annual_label.height * 1.5)
+    annual_values = {
+        value
+        for item in observations
+        if abs(item.y - annual_label.y) <= band and item.x > minimum_x
+        if (value := _integer_value(item.text)) is not None and 1 <= value <= 254
+    }
+    return all(value in annual_values for value in range(1, 6))
 
 
 def _is_matrix_header_text(text: str) -> bool:
@@ -1733,7 +1823,11 @@ def _contiguous_row_centers(
 
 
 def _normalize_numeric_text(text: str) -> str:
-    return re.sub(r"(?<=\d),\s+(?=\d)", ",", text.strip())
+    # OCR frequently inserts a visual word gap after a decimal separator
+    # (``176. 61``) or a thousands comma (``1, 234``).  These are still one
+    # numeric cell, whereas a bare digit-to-digit gap remains ambiguous and
+    # must not be concatenated.
+    return re.sub(r"(?<=\d)[,.]\s+(?=\d)", lambda match: match.group(0)[0], text.strip())
 
 
 def _numeric_value(text: str) -> str | None:

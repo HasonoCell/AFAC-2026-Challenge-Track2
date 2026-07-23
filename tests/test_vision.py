@@ -7,11 +7,19 @@ from afac_pipeline.vision import (
     VisionObservation,
     _contiguous_row_centers,
     _merge_split_numeric_fragments,
+    _numeric_value,
+    _normalize_numeric_text,
     reconstruct_numeric_matrix_from_observations,
 )
 
 
 class VisionMatrixTest(unittest.TestCase):
+    def test_normalizes_ocr_spacing_after_numeric_separators(self) -> None:
+        self.assertEqual(_normalize_numeric_text(" 176. 61 "), "176.61")
+        self.assertEqual(_normalize_numeric_text("1, 234. 50"), "1,234.50")
+        self.assertEqual(_numeric_value("176. 61"), "176.61")
+        self.assertIsNone(_numeric_value("176 61"))
+
     def test_merges_many_split_numeric_fragments_without_cross_pair_reuse(self) -> None:
         # Large local-OCR tables can place thousands of observations in two
         # neighbouring columns. The matcher must use a narrow y window rather
@@ -109,6 +117,75 @@ class VisionMatrixTest(unittest.TestCase):
         self.assertIsNotNone(table)
         assert table is not None
         self.assertEqual(table.header, ("保单年度末\\投保年龄", "10", "11", "12", "13"))
+        self.assertEqual(table.rows, tuple(expected_rows))
+
+    def test_reconstructs_matrix_with_diagonal_corner_and_annual_axis(self) -> None:
+        """A wider corner is valid only when its annual sequence is visible."""
+
+        observations = [
+            _observation(180, 130, "投保年龄"),
+            _observation(100, 100, "保单年度末"),
+        ]
+        observations.extend(
+            _observation(200 + column * 100, 100, str(column + 1))
+            for column in range(5)
+        )
+        expected_rows = []
+        for row in range(8):
+            values = (str(row), *(str(1_000 + row * 10 + column) for column in range(5)))
+            expected_rows.append(values)
+            observations.extend(
+                _observation(100 + column * 100, 200 + row * 50, value)
+                for column, value in enumerate(values)
+            )
+
+        result = reconstruct_numeric_matrix_from_observations(observations)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        table = parse_table(result.markdown)
+        self.assertIsNotNone(table)
+        assert table is not None
+        self.assertEqual(table.header, ("保单年度末\\投保年龄", "1", "2", "3", "4", "5"))
+        self.assertEqual(table.rows, tuple(expected_rows))
+
+    def test_reconstructs_right_aligned_numeric_columns(self) -> None:
+        """Varying value widths must not split one right-aligned column."""
+
+        observations = [
+            VisionObservation(95, 100, 10, 12, 1.0, "保单年度\\投保年龄"),
+        ]
+        for column in range(5):
+            right = 200 + column * 100
+            observations.append(
+                VisionObservation(right - 6, 100, 12, 12, 1.0, str(column)))
+        expected_rows = []
+        for row in range(8):
+            values = (str(row + 1), *(str(1000 + row * 10 + column) for column in range(5)))
+            expected_rows.append(values)
+            observations.append(VisionObservation(95, 200 + row * 40, 10, 12, 1.0, values[0]))
+            for column, value in enumerate(values[1:]):
+                right = 200 + column * 100
+                width = 18 if (row + column) % 2 == 0 else 46
+                observations.append(
+                    VisionObservation(
+                        right - width / 2,
+                        200 + row * 40,
+                        width,
+                        12,
+                        1.0,
+                        value,
+                    )
+                )
+
+        result = reconstruct_numeric_matrix_from_observations(observations)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        table = parse_table(result.markdown)
+        self.assertIsNotNone(table)
+        assert table is not None
+        self.assertEqual(table.header, ("保单年度\\投保年龄", "0", "1", "2", "3", "4"))
         self.assertEqual(table.rows, tuple(expected_rows))
 
     def test_rejects_matrix_without_semantic_header(self) -> None:
