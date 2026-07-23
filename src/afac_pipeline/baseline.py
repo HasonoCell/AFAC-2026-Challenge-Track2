@@ -30,14 +30,19 @@ from .images import (
     make_vertical_slices,
     profile_image,
 )
-from .local_ocr import LocalOCRError, run_local_numeric_matrix_ocr
+from .local_ocr import (
+    LocalOCRError,
+    run_local_numeric_matrix_ocr,
+    run_rapidocr_observations,
+)
 from .merge import merge_sliced_markdown
 from .pipeline import write_errors, write_submission
 from .submission import _read_submission_rows
 from .tables import html_tables_to_markdown, parse_table
+from .vision import render_observations_in_reading_order
 
 
-BASELINE_CACHE_SCHEMA_VERSION = 11
+BASELINE_CACHE_SCHEMA_VERSION = 12
 _MAX_HTML_CELLS_PER_ROW = 256
 
 
@@ -123,6 +128,19 @@ class BaselineConfig:
     long_low_confidence_char_density: float = 0.0
     long_fallback_slice_height: int = 0
     long_fallback_overlap: int = 0
+    # Extremely sparse remote output on a narrow prose page is a coverage
+    # failure, not a table-repair problem.  Keep local prose OCR opt-in and
+    # heavily bounded: it has no structural guesses and is used only when it
+    # materially restores missing text.
+    long_local_ocr_backend: str = "off"
+    long_local_ocr_min_pixels: int = 0
+    long_local_ocr_max_width: int = 0
+    long_local_ocr_trigger_char_density: float = 0.0
+    long_local_ocr_slice_height: int = 2_000
+    long_local_ocr_overlap: int = 80
+    long_local_ocr_workers: int = 4
+    long_local_ocr_min_char_density: float = 0.0
+    long_local_ocr_min_gain: int = 0
     long_min_chars: int = 20
     long_min_success_ratio: float = 1.0
     long_max_failed_parts: int = 0
@@ -221,6 +239,24 @@ def run_baseline_submission(
         raise ValueError("long_fallback_slice_height must be >= 0")
     if config.long_fallback_overlap < 0:
         raise ValueError("long_fallback_overlap must be >= 0")
+    if config.long_local_ocr_backend not in {"off", "rapidocr"}:
+        raise ValueError("long_local_ocr_backend must be one of: off, rapidocr")
+    if config.long_local_ocr_min_pixels < 0:
+        raise ValueError("long_local_ocr_min_pixels must be >= 0")
+    if config.long_local_ocr_max_width < 0:
+        raise ValueError("long_local_ocr_max_width must be >= 0")
+    if config.long_local_ocr_trigger_char_density < 0:
+        raise ValueError("long_local_ocr_trigger_char_density must be >= 0")
+    if config.long_local_ocr_slice_height <= 0:
+        raise ValueError("long_local_ocr_slice_height must be positive")
+    if config.long_local_ocr_overlap < 0:
+        raise ValueError("long_local_ocr_overlap must be >= 0")
+    if config.long_local_ocr_workers < 1:
+        raise ValueError("long_local_ocr_workers must be >= 1")
+    if config.long_local_ocr_min_char_density < 0:
+        raise ValueError("long_local_ocr_min_char_density must be >= 0")
+    if config.long_local_ocr_min_gain < 0:
+        raise ValueError("long_local_ocr_min_gain must be >= 0")
     if config.table_output_format not in {"html", "markdown"}:
         raise ValueError("table_output_format must be one of: html, markdown")
     all_records = list(records)
@@ -1776,7 +1812,15 @@ def _call_long_record(
         markdown=merged,
     )
     if fallback is not None:
-        return fallback
+        merged, fallback_calls = fallback
+        calls = fallback_calls
+    local_repair = _maybe_local_long_text_repair(
+        record=record,
+        config=config,
+        previous_markdown=merged,
+    )
+    if local_repair is not None:
+        return local_repair, calls
     return merged, calls
 
 
@@ -1842,6 +1886,80 @@ def _try_long_slice_fallback(
         )
         return None
     return fallback_markdown, calls + fallback_calls
+
+
+def _maybe_local_long_text_repair(
+    *,
+    record: ImageRecord,
+    config: BaselineConfig,
+    previous_markdown: str,
+) -> str | None:
+    """Restore prose coverage only when the remote long route is implausibly sparse.
+
+    The local renderer deliberately emits text lines rather than guessing
+    Markdown hierarchy or tables.  It is therefore reserved for narrow,
+    very-large documents where the remote output density proves that whole
+    regions are missing and where the local pass adds substantial content.
+    """
+
+    if config.long_local_ocr_backend != "rapidocr":
+        return None
+    profile = _profile_record(record, config)
+    pixels = profile.width * profile.height
+    if pixels < config.long_local_ocr_min_pixels:
+        return None
+    if (
+        config.long_local_ocr_max_width
+        and profile.width > config.long_local_ocr_max_width
+    ):
+        return None
+    remote_density = len(previous_markdown.strip()) / max(1, profile.content_height)
+    if remote_density >= config.long_local_ocr_trigger_char_density:
+        return None
+
+    image_bytes = record.read_bytes()
+    slices = make_vertical_slices(
+        file_name=record.file_name,
+        image_bytes=image_bytes,
+        slice_height=config.long_local_ocr_slice_height,
+        overlap=config.long_local_ocr_overlap,
+        jpeg_quality=config.jpeg_quality,
+    )
+    cache_dir = (
+        config.cache_dir
+        / _baseline_cache_namespace(config, "local_rapidocr_text")
+        / Path(record.file_name).stem
+    )
+    try:
+        observations = run_rapidocr_observations(
+            slices=slices,
+            cache_dir=cache_dir,
+            workers=config.long_local_ocr_workers,
+        )
+    except (OSError, LocalOCRError) as exc:
+        print(
+            f"  local rapidocr text route unavailable {record.file_name}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return None
+    rendered = render_observations_in_reading_order(observations)
+    local_density = len(rendered.strip()) / max(1, profile.content_height)
+    if local_density < config.long_local_ocr_min_char_density:
+        print(
+            f"  local rapidocr text route rejected {record.file_name}: "
+            f"density={local_density:.3f}"
+        )
+        return None
+    if len(rendered.strip()) < len(previous_markdown.strip()) + config.long_local_ocr_min_gain:
+        return None
+    if _duplicate_line_ratio(rendered) > config.table_max_duplicate_line_ratio:
+        return None
+    print(
+        f"  selected local rapidocr text repair {record.file_name}: "
+        f"remote_density={remote_density:.3f} local_density={local_density:.3f} "
+        f"chars={len(rendered)}"
+    )
+    return rendered
 
 
 def _call_with_retries(
@@ -2345,6 +2463,14 @@ def _baseline_cache_namespace(config: BaselineConfig, strategy: str) -> str:
             "long_low_confidence_char_density": config.long_low_confidence_char_density,
             "long_fallback_slice_height": config.long_fallback_slice_height,
             "long_fallback_overlap": config.long_fallback_overlap,
+            "long_local_ocr_backend": config.long_local_ocr_backend,
+            "long_local_ocr_min_pixels": config.long_local_ocr_min_pixels,
+            "long_local_ocr_max_width": config.long_local_ocr_max_width,
+            "long_local_ocr_trigger_char_density": config.long_local_ocr_trigger_char_density,
+            "long_local_ocr_slice_height": config.long_local_ocr_slice_height,
+            "long_local_ocr_overlap": config.long_local_ocr_overlap,
+            "long_local_ocr_min_char_density": config.long_local_ocr_min_char_density,
+            "long_local_ocr_min_gain": config.long_local_ocr_min_gain,
             "long_min_chars": config.long_min_chars,
             "long_min_success_ratio": config.long_min_success_ratio,
             "long_max_failed_parts": config.long_max_failed_parts,
@@ -2415,24 +2541,38 @@ def _baseline_cache_namespace(config: BaselineConfig, strategy: str) -> str:
             "table_refine_rows": config.table_refine_rows,
             "table_refine_cols": config.table_refine_cols,
         }
-    elif strategy.startswith("local_") and strategy.endswith("_matrix"):
+    elif strategy.startswith("local_") and (
+        strategy.endswith("_matrix") or strategy.endswith("_text")
+    ):
         # Local OCR observations are raw model outputs, just like remote tile
         # caches.  Keep them reusable when only reconstruction/refinement
         # selection changes; child tiles have deterministic unique names.
-        payload = {
+        payload: dict[str, object] = {
             "schema": 1,
             "strategy": strategy,
             "jpeg_quality": config.jpeg_quality,
-            "table_repair_rows": config.table_repair_rows,
-            "table_repair_cols": config.table_repair_cols,
-            "table_repair_target_tile_width": config.table_repair_target_tile_width,
-            "table_repair_target_tile_height": config.table_repair_target_tile_height,
-            "table_repair_vertical_aspect_threshold": config.table_repair_vertical_aspect_threshold,
-            "table_repair_max_calls": config.table_repair_max_calls,
-            "table_repair_content_threshold": config.table_repair_content_threshold,
-            "table_repair_content_scale": config.table_repair_content_scale,
-            "table_repair_content_padding": config.table_repair_content_padding,
         }
+        if strategy.endswith("_matrix"):
+            payload.update(
+                {
+                    "table_repair_rows": config.table_repair_rows,
+                    "table_repair_cols": config.table_repair_cols,
+                    "table_repair_target_tile_width": config.table_repair_target_tile_width,
+                    "table_repair_target_tile_height": config.table_repair_target_tile_height,
+                    "table_repair_vertical_aspect_threshold": config.table_repair_vertical_aspect_threshold,
+                    "table_repair_max_calls": config.table_repair_max_calls,
+                    "table_repair_content_threshold": config.table_repair_content_threshold,
+                    "table_repair_content_scale": config.table_repair_content_scale,
+                    "table_repair_content_padding": config.table_repair_content_padding,
+                }
+            )
+        else:
+            payload.update(
+                {
+                    "long_local_ocr_slice_height": config.long_local_ocr_slice_height,
+                    "long_local_ocr_overlap": config.long_local_ocr_overlap,
+                }
+            )
     else:
         payload = {
             "schema": BASELINE_CACHE_SCHEMA_VERSION,
@@ -2493,6 +2633,17 @@ def _baseline_cache_namespace(config: BaselineConfig, strategy: str) -> str:
             "table_fragment_max_blocks": config.table_fragment_max_blocks,
             "table_fragment_refine_cols": config.table_fragment_refine_cols,
             "long_aspect_threshold": config.long_aspect_threshold,
+            "long_low_confidence_char_density": config.long_low_confidence_char_density,
+            "long_fallback_slice_height": config.long_fallback_slice_height,
+            "long_fallback_overlap": config.long_fallback_overlap,
+            "long_local_ocr_backend": config.long_local_ocr_backend,
+            "long_local_ocr_min_pixels": config.long_local_ocr_min_pixels,
+            "long_local_ocr_max_width": config.long_local_ocr_max_width,
+            "long_local_ocr_trigger_char_density": config.long_local_ocr_trigger_char_density,
+            "long_local_ocr_slice_height": config.long_local_ocr_slice_height,
+            "long_local_ocr_overlap": config.long_local_ocr_overlap,
+            "long_local_ocr_min_char_density": config.long_local_ocr_min_char_density,
+            "long_local_ocr_min_gain": config.long_local_ocr_min_gain,
             "long_min_success_ratio": config.long_min_success_ratio,
             "long_max_failed_parts": config.long_max_failed_parts,
         }

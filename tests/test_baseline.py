@@ -22,6 +22,7 @@ from afac_pipeline.baseline import (
     _coverage_candidate_issue,
     _is_refinable_table_tile_failure,
     _is_truncation_error,
+    _maybe_local_long_text_repair,
     _maybe_local_matrix_repair,
     _maybe_repair_short_table,
     _repair_is_better,
@@ -38,7 +39,7 @@ from afac_pipeline.baseline import (
 from afac_pipeline.api import FinixDocError
 from afac_pipeline.datasets import ImageRecord
 from afac_pipeline.images import make_content_grid_slices, make_grid_slices
-from afac_pipeline.vision import VisionMatrixResult
+from afac_pipeline.vision import VisionMatrixResult, VisionObservation
 
 
 class _FakeClient:
@@ -188,6 +189,75 @@ class BaselineSubmissionTest(unittest.TestCase):
 
         self.assertIsNone(result)
         run_local.assert_not_called()
+
+    def test_local_long_text_route_requires_sparse_remote_and_material_coverage(self) -> None:
+        record = _record("sample.jpg", size=(20, 120))
+        config = BaselineConfig(
+            output_csv=Path("unused.csv"),
+            cache_dir=Path("unused-cache"),
+            long_local_ocr_backend="rapidocr",
+            long_local_ocr_min_pixels=1,
+            long_local_ocr_max_width=30,
+            long_local_ocr_trigger_char_density=0.10,
+            long_local_ocr_min_char_density=0.01,
+            long_local_ocr_min_gain=2,
+        )
+        observations = [
+            VisionObservation(10, 20, 10, 8, 0.99, "完整正文"),
+            VisionObservation(10, 40, 10, 8, 0.99, "第二行"),
+        ]
+
+        with patch(
+            "afac_pipeline.baseline.run_rapidocr_observations",
+            return_value=observations,
+        ) as local:
+            result = _maybe_local_long_text_repair(
+                record=record,
+                config=config,
+                previous_markdown="短",
+            )
+
+        self.assertEqual(result, "完整正文\n\n第二行")
+        local.assert_called_once()
+
+    def test_local_long_text_route_does_not_use_table_shape_to_reject_coverage(self) -> None:
+        record = _record("sample.jpg", size=(20, 120))
+        config = BaselineConfig(
+            output_csv=Path("unused.csv"),
+            cache_dir=Path("unused-cache"),
+            long_local_ocr_backend="rapidocr",
+            long_local_ocr_min_pixels=1,
+            long_local_ocr_max_width=30,
+            long_local_ocr_trigger_char_density=1.0,
+            long_local_ocr_min_char_density=0.01,
+            long_local_ocr_min_gain=2,
+        )
+        remote_fragment = "| A | B |\n| --- | --- |\n| 1 | 2 |\n"
+        observations = [
+            VisionObservation(
+                10,
+                20,
+                10,
+                8,
+                0.99,
+                "恢复的完整正文，覆盖此前遗漏的大段条款内容，并包含大量重要定义和责任说明。",
+            )
+        ]
+
+        with patch(
+            "afac_pipeline.baseline.run_rapidocr_observations",
+            return_value=observations,
+        ):
+            result = _maybe_local_long_text_repair(
+                record=record,
+                config=config,
+                previous_markdown=remote_fragment,
+            )
+
+        self.assertEqual(
+            result,
+            "恢复的完整正文，覆盖此前遗漏的大段条款内容，并包含大量重要定义和责任说明。",
+        )
 
     def test_accepted_local_matrix_avoids_remote_repair_fanout(self) -> None:
         markdown = (

@@ -9,11 +9,29 @@ from afac_pipeline.vision import (
     _merge_split_numeric_fragments,
     _numeric_value,
     _normalize_numeric_text,
+    render_observations_in_reading_order,
     reconstruct_numeric_matrix_from_observations,
 )
 
 
 class VisionMatrixTest(unittest.TestCase):
+    def test_renders_prose_boxes_by_geometry_and_deduplicates_overlap(self) -> None:
+        observations = [
+            VisionObservation(80, 100, 40, 12, 0.99, "正文"),
+            # The same box seen in the next overlapping image slice.
+            VisionObservation(80.5, 101, 40, 12, 0.99, "正文"),
+            # A neighbouring tile re-recognized the same long line with a
+            # punctuation variant; it must replace rather than concatenate.
+            VisionObservation(100, 120, 120, 12, 0.80, "旧的第二行"),
+            VisionObservation(101, 121, 120, 12, 0.99, "第二行"),
+            VisionObservation(80, 220, 80, 12, 0.99, "新段落"),
+        ]
+
+        self.assertEqual(
+            render_observations_in_reading_order(observations),
+            "正文\n\n第二行\n\n新段落",
+        )
+
     def test_normalizes_ocr_spacing_after_numeric_separators(self) -> None:
         self.assertEqual(_normalize_numeric_text(" 176. 61 "), "176.61")
         self.assertEqual(_normalize_numeric_text("1, 234. 50"), "1,234.50")

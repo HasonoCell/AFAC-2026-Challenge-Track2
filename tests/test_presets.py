@@ -10,6 +10,7 @@ from afac_pipeline.presets import (
     B_GENERALIZATION_V3,
     B_GENERALIZATION_V4,
     B_GENERALIZATION_V5,
+    B_GENERALIZATION_V6,
     apply_baseline_preset,
 )
 
@@ -104,6 +105,19 @@ class BaselinePresetTest(unittest.TestCase):
         )
         self.assertEqual(config.table_repair_content_scale, 0.05)
         self.assertEqual(config.table_repair_content_padding, 150)
+
+    def test_b_generalization_v6_adds_only_sparse_narrow_long_text_fallback(self) -> None:
+        config = apply_baseline_preset(
+            BaselineConfig(output_csv=Path("submission.csv"), cache_dir=Path("cache")),
+            B_GENERALIZATION_V6,
+        )
+
+        self.assertEqual(config.table_local_ocr_min_pixels, 20_000_000)
+        self.assertEqual(config.long_local_ocr_backend, "rapidocr")
+        self.assertEqual(config.long_local_ocr_min_pixels, 100_000_000)
+        self.assertEqual(config.long_local_ocr_max_width, 2_000)
+        self.assertEqual(config.long_local_ocr_trigger_char_density, 0.06)
+        self.assertEqual(config.long_local_ocr_min_char_density, 0.08)
 
     def test_unknown_preset_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown baseline preset"):

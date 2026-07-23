@@ -68,8 +68,35 @@ def run_rapidocr_numeric_matrix_ocr(
 ) -> VisionMatrixResult | None:
     """Run PP-OCRv4 through ONNX Runtime and reconstruct a numeric matrix."""
 
+    observations = run_rapidocr_observations(
+        slices=slices,
+        cache_dir=cache_dir,
+        workers=workers,
+        refine_saturated=refine_saturated,
+        max_refine_depth=max_refine_depth,
+    )
+    return reconstruct_numeric_matrix_from_observations(observations)
+
+
+def run_rapidocr_observations(
+    *,
+    slices: list[ImageSlice],
+    cache_dir: Path,
+    workers: int = 4,
+    refine_saturated: bool = False,
+    max_refine_depth: int = 1,
+) -> list[VisionObservation]:
+    """Run or replay RapidOCR tiles without forcing numeric-table inference.
+
+    Numeric matrix reconstruction deliberately evaluates several possible
+    lattices and is therefore inappropriate for normal prose-heavy long
+    documents.  Exposing the coordinate observations lets the long-document
+    route reuse the exact same cached, geometry-bound OCR pass while applying
+    a linear reading-order renderer instead.
+    """
+
     if not slices:
-        return None
+        return []
     tile_cache_dir = cache_dir / "rapidocr-v4" / "tiles"
     tile_cache_dir.mkdir(parents=True, exist_ok=True)
     _ensure_root_tile_manifest(tile_cache_dir, slices)
@@ -119,7 +146,7 @@ def run_rapidocr_numeric_matrix_ocr(
         ) from exc
     except Exception as exc:
         raise LocalOCRError(str(exc)) from exc
-    return reconstruct_numeric_matrix_from_observations(observations)
+    return observations
 
 
 def _ensure_root_tile_manifest(

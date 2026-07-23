@@ -16,6 +16,7 @@ from afac_pipeline.local_ocr import (
     _serialize_rapidocr_lines,
     _split_image_slice,
     run_local_numeric_matrix_ocr,
+    run_rapidocr_observations,
 )
 
 
@@ -150,6 +151,26 @@ class LocalOCRTest(unittest.TestCase):
         self.assertEqual(engine.call_count, 5)
         observations = reconstruct.call_args.args[0]
         self.assertEqual(len(observations), 4)
+
+    def test_observation_route_reuses_ocr_without_numeric_reconstruction(self) -> None:
+        buffer = BytesIO()
+        Image.new("RGB", (40, 40), "white").save(buffer, format="JPEG")
+        image_slice = ImageSlice("page.jpg", buffer.getvalue(), 0, 40, 0, 40, 40, 40)
+        line = [[[0, 0], [20, 0], [20, 10], [0, 10]], "正文", 0.9]
+
+        with (
+            TemporaryDirectory() as directory,
+            patch("afac_pipeline.local_ocr._rapidocr_engine", return_value=Mock(return_value=([line], None))),
+            patch("afac_pipeline.local_ocr.reconstruct_numeric_matrix_from_observations") as reconstruct,
+        ):
+            observations = run_rapidocr_observations(
+                slices=[image_slice],
+                cache_dir=Path(directory),
+                workers=1,
+            )
+
+        self.assertEqual([item.text for item in observations], ["正文"])
+        reconstruct.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -12,12 +12,14 @@ B_GENERALIZATION_V2 = "b-generalization-v2"
 B_GENERALIZATION_V3 = "b-generalization-v3"
 B_GENERALIZATION_V4 = "b-generalization-v4"
 B_GENERALIZATION_V5 = "b-generalization-v5"
+B_GENERALIZATION_V6 = "b-generalization-v6"
 BASELINE_PRESETS = (
     B_GENERALIZATION_V1,
     B_GENERALIZATION_V2,
     B_GENERALIZATION_V3,
     B_GENERALIZATION_V4,
     B_GENERALIZATION_V5,
+    B_GENERALIZATION_V6,
 )
 
 
@@ -41,21 +43,21 @@ def apply_baseline_preset(config: BaselineConfig, preset: str) -> BaselineConfig
         table_anchor_max_attempts=1,
         table_repair_min_chars=50_000,
         table_repair_target_tile_width=(
-            1_500 if preset == B_GENERALIZATION_V5 else 800
+            1_500 if preset in {B_GENERALIZATION_V5, B_GENERALIZATION_V6} else 800
         ),
         # The sparse mid-resolution route uses 6x4 content tiles on a
         # 15-MP portrait page; 650px would create an unnecessary eighth row.
         table_repair_target_tile_height=(
-            800 if preset in {B_GENERALIZATION_V4, B_GENERALIZATION_V5} else 650
+            800 if preset in {B_GENERALIZATION_V4, B_GENERALIZATION_V5, B_GENERALIZATION_V6} else 650
         ),
         table_repair_vertical_aspect_threshold=1.9,
         # v5's validated local-OCR cache was generated with this tighter
         # content box.  Keep cache coordinates and replay coordinates exact.
         table_repair_content_scale=(
-            0.05 if preset == B_GENERALIZATION_V5 else config.table_repair_content_scale
+            0.05 if preset in {B_GENERALIZATION_V5, B_GENERALIZATION_V6} else config.table_repair_content_scale
         ),
         table_repair_content_padding=(
-            150 if preset == B_GENERALIZATION_V5 else config.table_repair_content_padding
+            150 if preset in {B_GENERALIZATION_V5, B_GENERALIZATION_V6} else config.table_repair_content_padding
         ),
         table_repair_overlap=0,
         table_repair_snap_boundaries=False,
@@ -79,21 +81,22 @@ def apply_baseline_preset(config: BaselineConfig, preset: str) -> BaselineConfig
                 B_GENERALIZATION_V3,
                 B_GENERALIZATION_V4,
                 B_GENERALIZATION_V5,
+                B_GENERALIZATION_V6,
             }
             else "off"
         ),
         table_local_ocr_min_pixels=(
             10_000_000
             if preset == B_GENERALIZATION_V4
-            else (20_000_000 if preset == B_GENERALIZATION_V5 else 100_000_000)
+            else (20_000_000 if preset in {B_GENERALIZATION_V5, B_GENERALIZATION_V6} else 100_000_000)
         ),
         table_local_ocr_max_pixels=(
             20_000_000
             if preset == B_GENERALIZATION_V4
-            else (40_000_000 if preset == B_GENERALIZATION_V5 else 0)
+            else (40_000_000 if preset in {B_GENERALIZATION_V5, B_GENERALIZATION_V6} else 0)
         ),
         table_local_ocr_trigger_max_chars=(
-            1_000 if preset in {B_GENERALIZATION_V4, B_GENERALIZATION_V5} else 0
+            1_000 if preset in {B_GENERALIZATION_V4, B_GENERALIZATION_V5, B_GENERALIZATION_V6} else 0
         ),
         table_local_ocr_workers=4,
         table_local_ocr_refine_saturated=(preset == B_GENERALIZATION_V3),
@@ -104,6 +107,15 @@ def apply_baseline_preset(config: BaselineConfig, preset: str) -> BaselineConfig
         long_low_confidence_char_density=0.14,
         long_fallback_slice_height=8_000,
         long_fallback_overlap=300,
+        long_local_ocr_backend=("rapidocr" if preset == B_GENERALIZATION_V6 else "off"),
+        long_local_ocr_min_pixels=(100_000_000 if preset == B_GENERALIZATION_V6 else 0),
+        long_local_ocr_max_width=(2_000 if preset == B_GENERALIZATION_V6 else 0),
+        long_local_ocr_trigger_char_density=(0.06 if preset == B_GENERALIZATION_V6 else 0.0),
+        long_local_ocr_slice_height=2_000,
+        long_local_ocr_overlap=80,
+        long_local_ocr_workers=4,
+        long_local_ocr_min_char_density=(0.08 if preset == B_GENERALIZATION_V6 else 0.0),
+        long_local_ocr_min_gain=(1_000 if preset == B_GENERALIZATION_V6 else 0),
         long_min_success_ratio=0.80,
         long_max_failed_parts=1,
         on_error="placeholder",

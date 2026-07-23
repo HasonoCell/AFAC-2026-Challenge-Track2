@@ -56,6 +56,125 @@ class VisionMatrixResult:
         return self.populated_cells / self.total_cells
 
 
+def render_observations_in_reading_order(
+    observations: list[VisionObservation],
+    *,
+    minimum_confidence: float = 0.25,
+) -> str:
+    """Render prose OCR boxes in page reading order without table inference.
+
+    RapidOCR normally emits one box per printed text line on the narrow,
+    single-column long documents in this corpus.  Treating those boxes as a
+    numeric matrix is both slow and semantically wrong.  This renderer groups
+    only nearby baseline boxes, removes overlap-tile duplicates geometrically,
+    and preserves paragraph gaps.  It intentionally makes no heading or table
+    guesses: the remote Markdown remains preferable whenever it is complete.
+    """
+
+    usable = [
+        item
+        for item in observations
+        if item.confidence >= minimum_confidence and item.text.strip()
+    ]
+    if not usable:
+        return ""
+    median_height = statistics.median(item.height for item in usable)
+    y_tolerance = max(3.0, median_height * 0.65)
+    bands: list[list[VisionObservation]] = []
+    centers: list[float] = []
+    for item in sorted(usable, key=lambda candidate: (candidate.y, candidate.x)):
+        if bands and abs(item.y - centers[-1]) <= y_tolerance:
+            bands[-1].append(item)
+            centers[-1] = statistics.median(candidate.y for candidate in bands[-1])
+        else:
+            bands.append([item])
+            centers.append(item.y)
+
+    lines: list[tuple[float, str]] = []
+    for center, band in zip(centers, bands, strict=True):
+        fragments: list[VisionObservation] = []
+        for item in sorted(band, key=lambda candidate: candidate.x):
+            text = item.text.strip()
+            duplicate_index = next(
+                (
+                    index
+                    for index, previous in enumerate(fragments)
+                    if (
+                        text == previous.text.strip()
+                        and abs(item.x - previous.x)
+                        <= max(item.width, previous.width) * 0.35
+                    )
+                    or _horizontal_box_overlap(item, previous) >= 0.80
+                ),
+                None,
+            )
+            if duplicate_index is not None:
+                previous = fragments[duplicate_index]
+                # Adjacent OCR tiles can read their shared long line with
+                # punctuation differences.  The boxes overlap almost fully,
+                # so select one observation rather than concatenating both.
+                if item.confidence > previous.confidence:
+                    fragments[duplicate_index] = item
+                continue
+            fragments.append(item)
+        line = "".join(item.text.strip() for item in fragments)
+        if not line:
+            continue
+        if (
+            lines
+            and line == lines[-1][1]
+            and abs(center - lines[-1][0]) <= y_tolerance
+        ):
+            continue
+        lines.append((center, line))
+    if not lines:
+        return ""
+
+    gaps = [later - earlier for (earlier, _), (later, _) in zip(lines, lines[1:])]
+    typical_gap = statistics.median(gap for gap in gaps if gap > 0) if gaps else median_height
+    paragraph_gap = max(median_height * 1.8, typical_gap * 1.45)
+    paragraphs: list[str] = [lines[0][1]]
+    for (previous_y, previous_line), (current_y, line) in zip(lines, lines[1:]):
+        gap = current_y - previous_y
+        # Ground truth represents a wrapped prose paragraph as one Markdown
+        # block.  Joining its physical scan lines retains the same normalized
+        # text while keeping reading-order blocks comparable.  A short,
+        # isolated preceding line is a likely printed section/list heading and
+        # therefore stays separate even when its following gap is modest.
+        starts_paragraph = (
+            gap > paragraph_gap
+            or _is_reading_order_marker(previous_line)
+            or _is_reading_order_marker(line)
+            or (len(previous_line) <= 80 and gap > typical_gap * 1.20)
+        )
+        if starts_paragraph:
+            paragraphs.append(line)
+        else:
+            paragraphs[-1] += line
+    return "\n\n".join(paragraphs)
+
+
+def _horizontal_box_overlap(
+    first: VisionObservation,
+    second: VisionObservation,
+) -> float:
+    first_left = first.x - first.width / 2
+    first_right = first.x + first.width / 2
+    second_left = second.x - second.width / 2
+    second_right = second.x + second.width / 2
+    overlap = max(0.0, min(first_right, second_right) - max(first_left, second_left))
+    return overlap / max(1.0, min(first.width, second.width))
+
+
+def _is_reading_order_marker(text: str) -> bool:
+    """Recognize printed list/section starts without assigning Markdown level."""
+
+    compact = re.sub(r"\s+", "", text)
+    return bool(
+        re.match(r"^(?:[（(]?\d{1,3}[）).、]|[a-zA-Z][).、]|第[一二三四五六七八九十百]+)", compact)
+    )
+
+
 @dataclass(frozen=True)
 class _WideYearSchema:
     """Evidence-backed metadata layout for a wide annual-value matrix.
