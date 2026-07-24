@@ -9,6 +9,7 @@ import math
 import re
 import sys
 from dataclasses import dataclass
+from itertools import zip_longest
 from pathlib import Path
 from statistics import mean, median
 from typing import Iterable
@@ -210,14 +211,13 @@ def _aligned_table_text_similarity(left: str, right: str) -> float | None:
     right_tables = _table_text_grids(right)
     if not left_tables or len(left_tables) != len(right_tables):
         return None
-    if any(
-        len(left_rows) != len(right_rows)
-        for left_rows, right_rows in zip(left_tables, right_tables)
-    ):
-        return None
 
-    left_context = _normalize_text(_HTML_TABLE_BLOCK.sub(" ", left))
-    right_context = _normalize_text(_HTML_TABLE_BLOCK.sub(" ", right))
+    # Tables are compared cell-by-cell below.  They must be removed from both
+    # representations here: B submissions are pipe Markdown while train GTs
+    # are often HTML, and stripping only HTML makes every pipe table count a
+    # second time as unrelated prose.
+    left_context = _non_table_context(left)
+    right_context = _non_table_context(right)
     weighted_score = 0.0
     total_weight = 0
 
@@ -271,7 +271,12 @@ def _aligned_table_text_similarity(left: str, right: str) -> float | None:
     if left_context or right_context:
         add_pair(left_context, right_context)
     for left_rows, right_rows in zip(left_tables, right_tables):
-        for left_row, right_row in zip(left_rows, right_rows):
+        # Byte-safe submission budgets can retain a complete table header and
+        # a complete prefix of data rows.  Treat omitted rows as empty cells
+        # instead of falling back to brittle fixed character fingerprints.
+        # This remains bounded, preserves row order, and charges every absent
+        # ground-truth cell as a miss rather than granting it a free match.
+        for left_row, right_row in zip_longest(left_rows, right_rows, fillvalue=[]):
             add_row(left_row, right_row)
     if not total_weight:
         return None
@@ -286,6 +291,32 @@ def _table_text_grids(text: str) -> list[list[list[str]]]:
         ]
         for table in _document_tables(text)
     ]
+
+
+def _non_table_context(markdown: str) -> str:
+    """Normalize only prose outside complete HTML or pipe tables."""
+
+    without_html = _HTML_TABLE_BLOCK.sub("\n", markdown)
+    lines = without_html.splitlines()
+    retained: list[str] = []
+    index = 0
+    while index < len(lines):
+        if index + 1 < len(lines) and (
+            _is_pipe_table_row(lines[index].strip())
+            and _is_pipe_separator(lines[index + 1].strip())
+        ):
+            width = len(_split_pipe_row(lines[index].strip()))
+            index += 2
+            while (
+                index < len(lines)
+                and _is_pipe_table_row(lines[index].strip())
+                and len(_split_pipe_row(lines[index].strip())) == width
+            ):
+                index += 1
+            continue
+        retained.append(lines[index])
+        index += 1
+    return _normalize_text("\n".join(retained))
 
 
 def write_evaluation_rows(output_csv: Path, rows: Iterable[EvaluationRow]) -> None:

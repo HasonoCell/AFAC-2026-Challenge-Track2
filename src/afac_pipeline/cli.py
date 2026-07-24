@@ -9,6 +9,7 @@ from .api import ALLOWED_USER_IDS, DEFAULT_API_KEY, FinixDocClient, RotatingFini
 from .baseline import (
     BaselineConfig,
     rebuild_cached_local_matrix_repairs,
+    rebuild_local_matrix_repairs,
     run_baseline_submission,
 )
 from .datasets import (
@@ -840,11 +841,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory containing one cached local-OCR folder per image stem.",
     )
     local_rebuild_parser.add_argument(
+        "--file-names",
+        help="Optional comma-separated dataset filenames for a bounded cache replay.",
+    )
+    local_rebuild_parser.add_argument(
         "--preset",
         choices=BASELINE_PRESETS,
         default="b-generalization-v3",
     )
     local_rebuild_parser.set_defaults(func=cmd_rebuild_cached_local_matrix)
+
+    local_rebuild_parser = subparsers.add_parser(
+        "rebuild-local-matrix",
+        help="Run guarded local OCR matrices against an existing submission without remote API calls.",
+    )
+    local_rebuild_parser.add_argument("--dataset", choices=["a", "b"], required=True)
+    local_rebuild_parser.add_argument("--raw-dir", type=Path, default=DEFAULT_RAW_DIR)
+    local_rebuild_parser.add_argument("--base-csv", type=Path, required=True)
+    local_rebuild_parser.add_argument("--output-csv", type=Path, required=True)
+    local_rebuild_parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        required=True,
+        help="Fresh or geometry-bound local-OCR cache root.",
+    )
+    local_rebuild_parser.add_argument(
+        "--preset",
+        choices=BASELINE_PRESETS,
+        default="b-generalization-v6",
+    )
+    local_rebuild_parser.add_argument(
+        "--file-names",
+        help="Optional comma-separated dataset filenames for a bounded batch.",
+    )
+    local_rebuild_parser.set_defaults(func=cmd_rebuild_local_matrix)
 
     remerge_parser = subparsers.add_parser(
         "remerge-cached-tables",
@@ -1340,6 +1370,18 @@ def cmd_rebuild_cached_local_matrix(args: argparse.Namespace) -> None:
     records = list(iter_dataset_images(args.raw_dir, args.dataset))
     if not records:
         raise SystemExit("No images found. Run `inspect-data` and check data/raw first.")
+    requested_file_names = getattr(args, "file_names", None)
+    if requested_file_names:
+        names = _parse_str_list(requested_file_names, "--file-names")
+        if len(set(names)) != len(names):
+            raise SystemExit("--file-names must not contain duplicates")
+        records_by_name = {record.file_name: record for record in records}
+        unknown = [name for name in names if name not in records_by_name]
+        if unknown:
+            raise SystemExit(
+                "--file-names contains unknown dataset images: " + ", ".join(unknown[:5])
+            )
+        records = [records_by_name[name] for name in names]
     config = apply_baseline_preset(
         BaselineConfig(output_csv=args.output_csv, cache_dir=args.local_cache_root),
         args.preset,
@@ -1355,6 +1397,39 @@ def cmd_rebuild_cached_local_matrix(args: argparse.Namespace) -> None:
         "cached_local_matrix_rebuild_done: "
         f"output={result.output_csv}, scanned={result.scanned}, "
         f"cached={result.cached_records}, selected={result.selected}"
+    )
+
+
+def cmd_rebuild_local_matrix(args: argparse.Namespace) -> None:
+    records = list(iter_dataset_images(args.raw_dir, args.dataset))
+    if not records:
+        raise SystemExit("No images found. Run `inspect-data` and check data/raw first.")
+    requested_file_names = getattr(args, "file_names", None)
+    if requested_file_names:
+        names = _parse_str_list(requested_file_names, "--file-names")
+        if len(set(names)) != len(names):
+            raise SystemExit("--file-names must not contain duplicates")
+        records_by_name = {record.file_name: record for record in records}
+        unknown = [name for name in names if name not in records_by_name]
+        if unknown:
+            raise SystemExit(
+                "--file-names contains unknown dataset images: " + ", ".join(unknown[:5])
+            )
+        records = [records_by_name[name] for name in names]
+    config = apply_baseline_preset(
+        BaselineConfig(output_csv=args.output_csv, cache_dir=args.cache_dir),
+        args.preset,
+    )
+    result = rebuild_local_matrix_repairs(
+        records=records,
+        base_csv=args.base_csv,
+        output_csv=args.output_csv,
+        config=config,
+    )
+    print(
+        "local_matrix_rebuild_done: "
+        f"output={result.output_csv}, scanned={result.scanned}, "
+        f"selected={result.selected}"
     )
 
 

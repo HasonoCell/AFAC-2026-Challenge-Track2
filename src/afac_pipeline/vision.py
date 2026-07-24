@@ -1679,7 +1679,8 @@ def _matrix_header_candidates(
 ) -> list[VisionObservation]:
     candidates = [item for item in observations if _is_matrix_header_text(item.text)]
     # A common actuarial-table corner header is printed in two stacked cells:
-    # ``保单年度末`` above ``投保年龄``.  OCR reports those cells separately,
+    # ``保单年度`` (or the more specific ``保单年度末``) above ``投保年龄``.
+    # OCR reports those cells separately,
     # while the numeric annual headings share the first line.  Synthesize the
     # semantic corner only when both visible labels are aligned in the same
     # first column and close enough to belong to one header band.  This is
@@ -1688,7 +1689,7 @@ def _matrix_header_candidates(
     top_labels = [
         item
         for item in observations
-        if "保单年度末" in re.sub(r"\s+", "", item.text)
+        if "保单年度" in re.sub(r"\s+", "", item.text)
     ]
     age_labels = [
         item
@@ -1719,7 +1720,12 @@ def _matrix_header_candidates(
                     width=max(top_label.width, age_label.width),
                     height=max(top_label.height, age_label.height),
                     confidence=min(top_label.confidence, age_label.confidence),
-                    text="保单年度末\\投保年龄",
+                    # Preserve the observed annual-label wording.  The
+                    # generic matrix reconstruction only requires the
+                    # year/age semantics plus an adjacent `1..N` axis, so a
+                    # plain ``保单年度`` table is not a weaker inference than
+                    # the ``保单年度末`` variant.
+                    text=f"{re.sub(r'\\s+', '', top_label.text)}\\投保年龄",
                 )
             )
     if not candidates:

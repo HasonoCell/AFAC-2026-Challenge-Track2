@@ -137,41 +137,84 @@ def table_to_markdown(table: MarkdownTable) -> str:
 
 
 def retain_complete_pipe_table_rows(text: str, *, max_bytes: int) -> str:
-    """Fit one trailing pipe table into a UTF-8 budget without malformed rows."""
+    """Fit one or more pipe tables into a UTF-8 budget without broken rows.
+
+    Local reconstruction can recover several independent annual matrices from
+    one tall image.  Dropping the whole result merely because it is not a
+    *single* trailing table throws away the verified prefix.  Keep complete
+    leading tables and, if needed, retain only complete rows of the first
+    table that crosses the byte budget.  This preserves reading order and
+    leaves a syntactically complete Markdown document at every cutoff.
+    """
 
     if max_bytes <= 0:
         raise ValueError("max_bytes must be positive")
     if len(text.encode("utf-8")) <= max_bytes:
         return text
     lines = text.splitlines(keepends=True)
-    table_start = next(
-        (
-            index
-            for index in range(len(lines) - 1)
-            if "|" in lines[index] and _is_separator_line(lines[index + 1].strip())
-        ),
-        None,
-    )
-    if table_start is None:
+    table_blocks = _find_complete_pipe_table_blocks(lines)
+    if not table_blocks:
         raise ValueError("oversized output has no pipe table")
-    prefix = "".join(lines[:table_start])
-    table = parse_markdown_pipe_table("".join(lines[table_start:]))
-    if table is None:
-        raise ValueError("oversized output is not one complete trailing pipe table")
-    retained: list[tuple[str, ...]] = []
-    for row in table.rows:
-        candidate = prefix + table_to_markdown(
-            MarkdownTable(header=table.header, rows=tuple((*retained, row)))
-        )
-        if len(candidate.encode("utf-8")) > max_bytes:
+    compact = ""
+    cursor = 0
+    for table_start, table_end, table in table_blocks:
+        prefix = "".join(lines[cursor:table_start])
+        if len((compact + prefix).encode("utf-8")) > max_bytes:
             break
-        retained.append(row)
-    compact = prefix + table_to_markdown(
-        MarkdownTable(header=table.header, rows=tuple(retained))
-    )
-    if len(compact.encode("utf-8")) > max_bytes or not retained:
-        raise ValueError("table header cannot fit the requested byte budget")
+        compact += prefix
+        rendered = table_to_markdown(table)
+        if len((compact + rendered).encode("utf-8")) <= max_bytes:
+            compact += rendered
+            cursor = table_end
+            continue
+
+        retained: list[tuple[str, ...]] = []
+        for row in table.rows:
+            candidate = compact + table_to_markdown(
+                MarkdownTable(header=table.header, rows=tuple((*retained, row)))
+            )
+            if len(candidate.encode("utf-8")) > max_bytes:
+                break
+            retained.append(row)
+        if not retained:
+            raise ValueError("table header cannot fit the requested byte budget")
+        return compact + table_to_markdown(
+            MarkdownTable(header=table.header, rows=tuple(retained))
+        )
+
+    if not compact:
+        raise ValueError("table prefix cannot fit the requested byte budget")
     return compact
+
+
+def _find_complete_pipe_table_blocks(
+    lines: list[str],
+) -> list[tuple[int, int, MarkdownTable]]:
+    """Return parsed, non-overlapping table blocks in document order."""
+
+    blocks: list[tuple[int, int, MarkdownTable]] = []
+    index = 0
+    while index + 1 < len(lines):
+        if "|" not in lines[index] or not _is_separator_line(lines[index + 1].strip()):
+            index += 1
+            continue
+        start = index
+        end = index + 2
+        while end < len(lines):
+            # A new header begins a fresh table even when a producer omitted
+            # its customary blank separator.
+            if end + 1 < len(lines) and _is_separator_line(lines[end + 1].strip()):
+                break
+            if "|" not in lines[end] or not lines[end].strip():
+                break
+            end += 1
+        table = parse_markdown_pipe_table("".join(lines[start:end]))
+        if table is None:
+            index += 1
+            continue
+        blocks.append((start, end, table))
+        index = end
+    return blocks
 
 
 def table_to_html(table: MarkdownTable) -> str:
@@ -1439,6 +1482,23 @@ class _SimpleHTMLTableParser(HTMLParser):
         self.current_row_group = self.next_row_group
         self.next_row_group += 1
 
+    def _finish_current_cell(self) -> None:
+        if not self.in_cell:
+            return
+        self.current_row.append(
+            _HTMLCell(
+                text=_normalize_cell("".join(self.current_cell_text)),
+                rowspan=self.current_cell_rowspan,
+                colspan=self.current_cell_colspan,
+                is_header=self.current_cell_is_header,
+            )
+        )
+        self.current_cell_text = []
+        self.current_cell_rowspan = 1
+        self.current_cell_colspan = 1
+        self.current_cell_is_header = False
+        self.in_cell = False
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
         if tag == "table":
@@ -1463,8 +1523,13 @@ class _SimpleHTMLTableParser(HTMLParser):
             self.in_row = True
             self.current_row = []
         elif tag in {"td", "th"}:
+            # HTML permits a cell to end implicitly when its next sibling
+            # begins.  Ground-truth financial tables occasionally contain a
+            # one-character typo such as ``value/td><td>next``; recover that
+            # one cell locally so evaluation and conversion do not discard a
+            # whole 100-column table.  Submission validation remains strict.
             if self.in_cell:
-                self.unsupported = True
+                self._finish_current_cell()
             span = _read_span_attrs(attrs)
             if span is None:
                 self.unsupported = True
@@ -1480,19 +1545,7 @@ class _SimpleHTMLTableParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
         if tag in {"td", "th"} and self.in_cell:
-            self.current_row.append(
-                _HTMLCell(
-                    text=_normalize_cell("".join(self.current_cell_text)),
-                    rowspan=self.current_cell_rowspan,
-                    colspan=self.current_cell_colspan,
-                    is_header=self.current_cell_is_header,
-                )
-            )
-            self.current_cell_text = []
-            self.current_cell_rowspan = 1
-            self.current_cell_colspan = 1
-            self.current_cell_is_header = False
-            self.in_cell = False
+            self._finish_current_cell()
         elif tag == "tr" and self.in_row:
             if self.current_row:
                 self.rows.append(self.current_row)
@@ -1598,8 +1651,36 @@ def _html_header_row_count(rows: list[list[_HTMLCell]]) -> int:
         if row and all(cell.is_header for cell in row):
             count += 1
             continue
+        # Financial annual-value tables commonly use ``<th rowspan=2>`` for
+        # metadata and a merged ``<th colspan=N>保单年度末</th>``, but encode
+        # the leaf ``1..N`` year axis with ``<td>``.  Treat that second row as
+        # header only when the parent topology and a consecutive year sequence
+        # prove it is an axis, rather than a numeric first data row.
+        if count == 1 and _is_annual_leaf_header(rows[0], row):
+            count += 1
+            continue
         break
     return max(1, count)
+
+
+def _is_annual_leaf_header(
+    parent: list[_HTMLCell],
+    candidate: list[_HTMLCell],
+) -> bool:
+    if not parent or not candidate:
+        return False
+    if not any(cell.colspan > 1 for cell in parent):
+        return False
+    values: list[int] = []
+    for cell in candidate:
+        text = _normalize_cell(cell.text)
+        if not text.isdigit():
+            return False
+        value = int(text)
+        if not 1 <= value <= 254:
+            return False
+        values.append(value)
+    return len(values) >= 5 and values == list(range(1, len(values) + 1))
 
 
 def _has_explicit_html_header(rows: list[list[_HTMLCell]]) -> bool:

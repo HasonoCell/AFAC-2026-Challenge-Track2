@@ -31,14 +31,16 @@ from afac_pipeline.baseline import (
     _table_repair_trigger_chars,
     _table_repair_failed_part_budget,
     _should_use_table_coverage,
+    _should_attempt_local_matrix_repair,
     _table_candidate_issue,
     _try_long_slice_fallback,
     rebuild_cached_local_matrix_repairs,
+    rebuild_local_matrix_repairs,
     run_baseline_submission,
 )
 from afac_pipeline.api import FinixDocError
 from afac_pipeline.datasets import ImageRecord
-from afac_pipeline.images import make_content_grid_slices, make_grid_slices
+from afac_pipeline.images import make_content_grid_slices, make_grid_slices, profile_image
 from afac_pipeline.vision import VisionMatrixResult, VisionObservation
 
 
@@ -84,6 +86,58 @@ class _FakeClient:
 
 
 class BaselineSubmissionTest(unittest.TestCase):
+    def test_local_matrix_rebuild_uses_submission_as_the_no_api_baseline(self) -> None:
+        record = _inked_record(
+            "sample.jpg",
+            source="memory",
+            size=(120, 120),
+            ink_box=(10, 10, 110, 110),
+        )
+        recovered = "<table><tr><td>recovered</td></tr></table>\n"
+        vision_result = VisionMatrixResult(
+            markdown=recovered,
+            rows=1,
+            cols=1,
+            populated_cells=1,
+            total_cells=1,
+            header_sequence_inliers=1,
+            row_sequence_inliers=1,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base_csv = root / "base.csv"
+            output_csv = root / "repair.csv"
+            with base_csv.open("w", encoding="utf-8", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=["file_name", "ground_truth"])
+                writer.writeheader()
+                writer.writerow({"file_name": record.file_name, "ground_truth": "short"})
+            config = BaselineConfig(
+                output_csv=output_csv,
+                cache_dir=root / "fresh-local-cache",
+                table_local_ocr_backend="rapidocr",
+                table_local_ocr_min_pixels=0,
+                table_repair_min_gain=0,
+                table_repair_content_scale=1.0,
+                table_repair_content_padding=0,
+            )
+            with patch(
+                "afac_pipeline.baseline.run_local_numeric_matrix_ocr",
+                return_value=vision_result,
+            ) as run_local:
+                result = rebuild_local_matrix_repairs(
+                    records=[record],
+                    base_csv=base_csv,
+                    output_csv=output_csv,
+                    config=config,
+                )
+
+            self.assertEqual(result.selected_file_names, ("sample.jpg",))
+            run_local.assert_called_once()
+            with output_csv.open(encoding="utf-8", newline="") as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual(rows, [{"file_name": "sample.jpg", "ground_truth": recovered}])
+
     def test_cached_local_matrix_rebuild_uses_complete_tsv_cache_without_api(self) -> None:
         record = _inked_record(
             "sample.jpg",
@@ -189,6 +243,37 @@ class BaselineSubmissionTest(unittest.TestCase):
 
         self.assertIsNone(result)
         run_local.assert_not_called()
+
+    def test_local_matrix_density_trigger_accepts_sparse_nontrivial_text(self) -> None:
+        record = _inked_record(
+            "sample.jpg",
+            source="memory",
+            size=(120, 120),
+            ink_box=(10, 10, 110, 110),
+        )
+        config = BaselineConfig(
+            output_csv=Path("unused.csv"),
+            cache_dir=Path("unused-cache"),
+            table_local_ocr_backend="rapidocr",
+            table_local_ocr_min_pixels=0,
+            table_local_ocr_trigger_max_chars=10,
+            table_local_ocr_trigger_max_chars_per_content_pixel=1.0,
+            table_repair_content_scale=1.0,
+            table_repair_content_padding=0,
+        )
+        profile = profile_image(
+            image_bytes=record.read_bytes(),
+            threshold=config.table_repair_content_threshold,
+            sample_scale=config.table_repair_content_scale,
+        )
+
+        self.assertTrue(
+            _should_attempt_local_matrix_repair(
+                profile=profile,
+                previous_markdown="x" * 100,
+                config=config,
+            )
+        )
 
     def test_local_long_text_route_requires_sparse_remote_and_material_coverage(self) -> None:
         record = _record("sample.jpg", size=(20, 120))

@@ -93,10 +93,26 @@ def apply_baseline_preset(config: BaselineConfig, preset: str) -> BaselineConfig
         table_local_ocr_max_pixels=(
             20_000_000
             if preset == B_GENERALIZATION_V4
-            else (40_000_000 if preset in {B_GENERALIZATION_V5, B_GENERALIZATION_V6} else 0)
+            # v6 retains v5's sparse-table guard but extends the upper bound
+            # through the independently validated 94.75MP annual-matrix
+            # family.  Pages above 100MP stay on the already-established
+            # large-table route rather than widening this CPU fallback without
+            # evidence.
+            else (
+                100_000_000
+                if preset == B_GENERALIZATION_V6
+                else (40_000_000 if preset == B_GENERALIZATION_V5 else 0)
+            )
         ),
         table_local_ocr_trigger_max_chars=(
             1_000 if preset in {B_GENERALIZATION_V4, B_GENERALIZATION_V5, B_GENERALIZATION_V6} else 0
+        ),
+        # A 94.75MP table with only a few tens of thousands of recognized
+        # characters can still be a severe coverage failure.  This threshold
+        # is measured against detected page ink, so it scales across page
+        # sizes and cannot be a filename or title exception.
+        table_local_ocr_trigger_max_chars_per_content_pixel=(
+            0.004 if preset == B_GENERALIZATION_V6 else 0.0
         ),
         table_local_ocr_workers=4,
         table_local_ocr_refine_saturated=(preset == B_GENERALIZATION_V3),

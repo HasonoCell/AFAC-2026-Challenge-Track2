@@ -113,6 +113,9 @@ class BaselinePresetTest(unittest.TestCase):
         )
 
         self.assertEqual(config.table_local_ocr_min_pixels, 20_000_000)
+        self.assertEqual(config.table_local_ocr_max_pixels, 100_000_000)
+        self.assertEqual(config.table_local_ocr_max_output_bytes, 190_000)
+        self.assertEqual(config.table_local_ocr_trigger_max_chars_per_content_pixel, 0.004)
         self.assertEqual(config.long_local_ocr_backend, "rapidocr")
         self.assertEqual(config.long_local_ocr_min_pixels, 100_000_000)
         self.assertEqual(config.long_local_ocr_max_width, 2_000)

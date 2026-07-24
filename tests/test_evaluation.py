@@ -157,6 +157,42 @@ class EvaluationTest(unittest.TestCase):
         self.assertGreater(row.text_similarity, 94.0)
         self.assertLess(row.text_similarity, 100.0)
 
+    def test_very_large_table_prefix_uses_cell_alignment(self) -> None:
+        """A complete submitted prefix must not collapse to fingerprint noise."""
+        rows = [
+            f"<tr><td>{index:05d}</td><td>{index + 1:05d}</td></tr>"
+            for index in range(3_000)
+        ]
+        ground_truth = "<table><tr><th>A</th><th>B</th></tr>" + "".join(rows) + "</table>"
+        prediction = "<table><tr><th>A</th><th>B</th></tr>" + "".join(rows[:2_000]) + "</table>"
+
+        row = evaluate_pair(
+            file_name="sample.jpg",
+            prediction=prediction,
+            ground_truth=ground_truth,
+        )
+
+        self.assertGreater(row.text_similarity, 60.0)
+        self.assertLess(row.text_similarity, 80.0)
+
+    def test_very_large_pipe_table_does_not_count_twice_as_prose(self) -> None:
+        rows = [
+            f"<tr><td>{index:05d}</td><td>{index + 1:05d}</td></tr>"
+            for index in range(3_000)
+        ]
+        ground_truth = "# 标题\n<table><tr><th>A</th><th>B</th></tr>" + "".join(rows) + "</table>"
+        prediction = "# 标题\n| A | B |\n| --- | --- |\n" + "".join(
+            f"| {index:05d} | {index + 1:05d} |\n" for index in range(3_000)
+        )
+
+        row = evaluate_pair(
+            file_name="sample.jpg",
+            prediction=prediction,
+            ground_truth=ground_truth,
+        )
+
+        self.assertEqual(row.text_similarity, 100.0)
+
     def test_table_structure_is_independent_of_html_or_pipe_representation(self) -> None:
         ground_truth = (
             "<table><tr><td>A</td><td>B</td></tr>"

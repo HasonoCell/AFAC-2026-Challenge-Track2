@@ -97,6 +97,9 @@ class BaselineConfig:
     table_local_ocr_min_pixels: int = 100_000_000
     table_local_ocr_max_pixels: int = 0
     table_local_ocr_trigger_max_chars: int = 0
+    # A dense but partial table can contain more than a thousand characters;
+    # compare OCR text to visible ink as a second, scale-independent trigger.
+    table_local_ocr_trigger_max_chars_per_content_pixel: float = 0.0
     table_local_ocr_workers: int = 4
     table_local_ocr_refine_saturated: bool = False
     table_local_ocr_max_refine_depth: int = 1
@@ -178,6 +181,16 @@ class CachedLocalMatrixRepairStats:
 
 
 @dataclass(frozen=True)
+class LocalMatrixRepairStats:
+    """Results of an offline local-matrix rebuild from an existing CSV base."""
+
+    scanned: int
+    selected: int
+    selected_file_names: tuple[str, ...]
+    output_csv: Path
+
+
+@dataclass(frozen=True)
 class TableCandidateScore:
     score: float
     reason: str
@@ -230,6 +243,10 @@ def run_baseline_submission(
         )
     if config.table_local_ocr_trigger_max_chars < 0:
         raise ValueError("table_local_ocr_trigger_max_chars must be >= 0")
+    if config.table_local_ocr_trigger_max_chars_per_content_pixel < 0:
+        raise ValueError(
+            "table_local_ocr_trigger_max_chars_per_content_pixel must be >= 0"
+        )
     if config.table_local_ocr_workers < 1:
         raise ValueError("table_local_ocr_workers must be >= 1")
     if config.table_local_ocr_max_refine_depth < 0:
@@ -403,16 +420,12 @@ def rebuild_cached_local_matrix_repairs(
         scanned += 1
         if record.file_name not in base:
             continue
-        if (
-            config.table_local_ocr_trigger_max_chars
-            and len(base[record.file_name]) > config.table_local_ocr_trigger_max_chars
-        ):
-            continue
         profile = _profile_record(record, config)
-        pixels = profile.width * profile.height
-        if pixels < config.table_local_ocr_min_pixels:
-            continue
-        if config.table_local_ocr_max_pixels and pixels > config.table_local_ocr_max_pixels:
+        if not _should_attempt_local_matrix_repair(
+            profile=profile,
+            previous_markdown=base[record.file_name],
+            config=config,
+        ):
             continue
         image_bytes = record.read_bytes()
         repair_rows, repair_cols = _table_repair_grid(image_bytes, config)
@@ -487,6 +500,57 @@ def rebuild_cached_local_matrix_repairs(
     return CachedLocalMatrixRepairStats(
         scanned=scanned,
         cached_records=cached_records,
+        selected=len(selected_rows),
+        selected_file_names=tuple(row["file_name"] for row in selected_rows),
+        output_csv=output_csv,
+    )
+
+
+def rebuild_local_matrix_repairs(
+    *,
+    records: Iterable[ImageRecord],
+    base_csv: Path,
+    output_csv: Path,
+    config: BaselineConfig,
+) -> LocalMatrixRepairStats:
+    """Run the guarded CPU matrix route against an existing submission.
+
+    The primary baseline invokes local reconstruction only after a remote
+    anchor request.  That made it impossible to expand a validated local OCR
+    route from a known, platform-safe CSV without spending API quota again.
+    This companion path reuses the CSV's existing Markdown as the acceptance
+    baseline, while retaining exactly the same pixel, schema, coverage,
+    duplicate, byte-budget, and table-format guards as production.
+    """
+
+    if config.table_local_ocr_backend == "off":
+        raise ValueError("local matrix rebuild requires a local OCR backend")
+    base = _read_submission_rows(base_csv)
+    selected_rows: list[dict[str, str]] = []
+    scanned = 0
+    for record in records:
+        scanned += 1
+        previous_markdown = base.get(record.file_name)
+        if previous_markdown is None:
+            continue
+        candidate_markdown = _maybe_local_matrix_repair(
+            record=record,
+            config=config,
+            previous_markdown=previous_markdown,
+        )
+        if candidate_markdown is None:
+            continue
+        selected_rows.append(
+            {
+                "file_name": record.file_name,
+                "ground_truth": candidate_markdown,
+            }
+        )
+
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    write_submission(output_csv, selected_rows)
+    return LocalMatrixRepairStats(
+        scanned=scanned,
         selected=len(selected_rows),
         selected_file_names=tuple(row["file_name"] for row in selected_rows),
         output_csv=output_csv,
@@ -732,14 +796,10 @@ def _maybe_local_matrix_repair(
     if config.table_local_ocr_backend == "off":
         return None
     profile = _profile_record(record, config)
-    pixels = profile.width * profile.height
-    if pixels < config.table_local_ocr_min_pixels:
-        return None
-    if config.table_local_ocr_max_pixels and pixels > config.table_local_ocr_max_pixels:
-        return None
-    if (
-        config.table_local_ocr_trigger_max_chars
-        and len(previous_markdown) > config.table_local_ocr_trigger_max_chars
+    if not _should_attempt_local_matrix_repair(
+        profile=profile,
+        previous_markdown=previous_markdown,
+        config=config,
     ):
         return None
     image_bytes = record.read_bytes()
@@ -807,6 +867,32 @@ def _maybe_local_matrix_repair(
         f"coverage={result.coverage:.3f} chars={len(candidate_markdown)}"
     )
     return candidate_markdown
+
+
+def _should_attempt_local_matrix_repair(
+    *,
+    profile: DocumentProfile,
+    previous_markdown: str,
+    config: BaselineConfig,
+) -> bool:
+    """Route only sparse remote table text into the bounded CPU fallback."""
+
+    pixels = profile.width * profile.height
+    if pixels < config.table_local_ocr_min_pixels:
+        return False
+    if config.table_local_ocr_max_pixels and pixels > config.table_local_ocr_max_pixels:
+        return False
+
+    within_char_limit = (
+        not config.table_local_ocr_trigger_max_chars
+        or len(previous_markdown) <= config.table_local_ocr_trigger_max_chars
+    )
+    within_content_density_limit = (
+        config.table_local_ocr_trigger_max_chars_per_content_pixel > 0
+        and len(previous_markdown) / max(1, profile.content_pixels)
+        <= config.table_local_ocr_trigger_max_chars_per_content_pixel
+    )
+    return within_char_limit or within_content_density_limit
 
 
 def _call_table_content_grid_record(
@@ -2629,6 +2715,7 @@ def _baseline_cache_namespace(config: BaselineConfig, strategy: str) -> str:
             "table_local_ocr_min_pixels": config.table_local_ocr_min_pixels,
             "table_local_ocr_max_pixels": config.table_local_ocr_max_pixels,
             "table_local_ocr_trigger_max_chars": config.table_local_ocr_trigger_max_chars,
+            "table_local_ocr_trigger_max_chars_per_content_pixel": config.table_local_ocr_trigger_max_chars_per_content_pixel,
             "table_local_ocr_refine_saturated": config.table_local_ocr_refine_saturated,
             "table_local_ocr_max_refine_depth": config.table_local_ocr_max_refine_depth,
             "table_anchor_max_candidates": config.table_anchor_max_candidates,

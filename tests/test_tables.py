@@ -42,6 +42,29 @@ class MarkdownTableTest(unittest.TestCase):
             max_bytes=len("标题\n| A | B |\n| --- | --- |\n| 一 | 二 |\n".encode()),
         )
         self.assertEqual(compact, "标题\n| A | B |\n| --- | --- |\n| 一 | 二 |\n")
+
+    def test_row_budget_keeps_complete_prefix_across_multiple_tables(self) -> None:
+        source = (
+            "标题\n\n"
+            "| A | B |\n| --- | --- |\n| 一 | 二 |\n\n"
+            "小标题\n\n"
+            "| C | D |\n| --- | --- |\n| 三 | 四 |\n| 五 | 六 |\n"
+        )
+        budget = len(
+            (
+                "标题\n\n"
+                "| A | B |\n| --- | --- |\n| 一 | 二 |\n\n"
+                "小标题\n\n"
+                "| C | D |\n| --- | --- |\n| 三 | 四 |\n"
+            ).encode()
+        )
+
+        compact = retain_complete_pipe_table_rows(source, max_bytes=budget)
+
+        self.assertEqual(len(compact.encode()), budget)
+        self.assertIn("| 一 | 二 |", compact)
+        self.assertIn("| 三 | 四 |", compact)
+        self.assertNotIn("| 五 | 六 |", compact)
     def test_html_conversion_preserves_expanded_grid(self) -> None:
         converted = html_tables_to_markdown(
             '<table><tr><th rowspan="2">A</th><th colspan="2">B</th></tr>'
@@ -55,6 +78,30 @@ class MarkdownTableTest(unittest.TestCase):
         assert parsed is not None
         self.assertEqual(parsed.header, ("A", "B / 1", "B / 2"))
         self.assertEqual(parsed.rows, (("x", "y", "z"),))
+
+    def test_html_conversion_flattens_td_annual_leaf_axis_as_header(self) -> None:
+        converted = html_tables_to_markdown(
+            "<table><tr><th rowspan=\"2\">年龄</th><th colspan=\"5\">保单年度末</th></tr>"
+            "<tr><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td></tr>"
+            "<tr><td>20</td><td>1.1</td><td>2.2</td><td>3.3</td><td>4.4</td><td>5.5</td></tr></table>"
+        )
+        parsed = parse_markdown_pipe_table(converted)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(
+            parsed.header,
+            ("年龄", "保单年度末 / 1", "保单年度末 / 2", "保单年度末 / 3", "保单年度末 / 4", "保单年度末 / 5"),
+        )
+        self.assertEqual(parsed.rows, (("20", "1.1", "2.2", "3.3", "4.4", "5.5"),))
+
+    def test_html_parser_recovers_a_single_implicit_cell_closure(self) -> None:
+        table = parse_html_table(
+            "<table><tr><th>A</th><th>B</th></tr>"
+            "<tr><td>first/td><td>second</td></tr></table>"
+        )
+        self.assertIsNotNone(table)
+        assert table is not None
+        self.assertEqual(table.rows, (("first/td>", "second"),))
 
     def test_parse_and_format_simple_pipe_table(self) -> None:
         table = parse_markdown_pipe_table(

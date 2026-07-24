@@ -137,6 +137,36 @@ class VisionMatrixTest(unittest.TestCase):
         self.assertEqual(table.header, ("保单年度末\\投保年龄", "10", "11", "12", "13"))
         self.assertEqual(table.rows, tuple(expected_rows))
 
+    def test_reconstructs_matrix_with_plain_policy_year_stacked_corner(self) -> None:
+        """The annual-age table family need not spell the label as ``末``."""
+
+        observations = [
+            _observation(100, 100, "保单年度"),
+            _observation(100, 130, "投保年龄"),
+        ]
+        observations.extend(
+            _observation(200 + column * 100, 100, str(column + 1))
+            for column in range(6)
+        )
+        expected_rows = []
+        for row in range(6):
+            values = (str(row), *(str(1_000 + row * 10 + column) for column in range(6)))
+            expected_rows.append(values)
+            observations.extend(
+                _observation(100 + column * 100, 200 + row * 50, value)
+                for column, value in enumerate(values)
+            )
+
+        result = reconstruct_numeric_matrix_from_observations(observations)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        table = parse_table(result.markdown)
+        self.assertIsNotNone(table)
+        assert table is not None
+        self.assertEqual(table.header, ("保单年度\\投保年龄", "1", "2", "3", "4", "5", "6"))
+        self.assertEqual(table.rows, tuple(expected_rows))
+
     def test_reconstructs_matrix_with_diagonal_corner_and_annual_axis(self) -> None:
         """A wider corner is valid only when its annual sequence is visible."""
 
@@ -600,8 +630,11 @@ class VisionMatrixTest(unittest.TestCase):
         self.assertIn('<th rowspan="2">交费期间</th>', result.markdown)
         self.assertIn('<th colspan="12">保单年度末</th>', result.markdown)
         self.assertIn("<tr><td>1</td><td>2</td>", result.markdown)
-        self.assertEqual(table.rows[0][:3], ("交费期间", "性别", "投保年龄（周岁）"))
-        self.assertEqual(table.rows[1:], tuple(expected_rows))
+        # The parser now preserves the two-level header instead of treating
+        # the second annual-label row as table body, so the metadata cells
+        # remain headers and every observed actuarial row stays data.
+        self.assertEqual(table.header[:3], ("交费期间", "性别", "投保年龄（周岁）"))
+        self.assertEqual(table.rows, tuple(expected_rows))
 
     def test_reconstructs_wide_matrix_with_two_text_metadata_columns(self) -> None:
         """Insurance and payment periods can both be textual body columns."""
