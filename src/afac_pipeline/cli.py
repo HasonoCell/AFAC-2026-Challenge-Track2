@@ -845,6 +845,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional comma-separated dataset filenames for a bounded cache replay.",
     )
     local_rebuild_parser.add_argument(
+        "--table-local-ocr-y-overlap",
+        type=int,
+        default=0,
+        help="Vertical pixel overlap for the local OCR grid (must match the cache).",
+    )
+    local_rebuild_parser.add_argument(
+        "--table-local-ocr-workers",
+        type=int,
+        help="Override the preset's local OCR worker count.",
+    )
+    local_rebuild_parser.add_argument(
         "--preset",
         choices=BASELINE_PRESETS,
         default="b-generalization-v3",
@@ -873,6 +884,17 @@ def build_parser() -> argparse.ArgumentParser:
     local_rebuild_parser.add_argument(
         "--file-names",
         help="Optional comma-separated dataset filenames for a bounded batch.",
+    )
+    local_rebuild_parser.add_argument(
+        "--table-local-ocr-y-overlap",
+        type=int,
+        default=0,
+        help="Vertical pixel overlap for seam-safe local OCR tiles.",
+    )
+    local_rebuild_parser.add_argument(
+        "--table-local-ocr-workers",
+        type=int,
+        help="Override the preset's local OCR worker count.",
     )
     local_rebuild_parser.set_defaults(func=cmd_rebuild_local_matrix)
 
@@ -1383,9 +1405,18 @@ def cmd_rebuild_cached_local_matrix(args: argparse.Namespace) -> None:
             )
         records = [records_by_name[name] for name in names]
     config = apply_baseline_preset(
-        BaselineConfig(output_csv=args.output_csv, cache_dir=args.local_cache_root),
+        BaselineConfig(
+            output_csv=args.output_csv,
+            cache_dir=args.local_cache_root,
+            table_local_ocr_y_overlap=args.table_local_ocr_y_overlap,
+        ),
         args.preset,
     )
+    if args.table_local_ocr_workers is not None:
+        config = replace(
+            config,
+            table_local_ocr_workers=args.table_local_ocr_workers,
+        )
     result = rebuild_cached_local_matrix_repairs(
         records=records,
         base_csv=args.base_csv,
@@ -1417,9 +1448,18 @@ def cmd_rebuild_local_matrix(args: argparse.Namespace) -> None:
             )
         records = [records_by_name[name] for name in names]
     config = apply_baseline_preset(
-        BaselineConfig(output_csv=args.output_csv, cache_dir=args.cache_dir),
+        BaselineConfig(
+            output_csv=args.output_csv,
+            cache_dir=args.cache_dir,
+            table_local_ocr_y_overlap=args.table_local_ocr_y_overlap,
+        ),
         args.preset,
     )
+    if args.table_local_ocr_workers is not None:
+        config = replace(
+            config,
+            table_local_ocr_workers=args.table_local_ocr_workers,
+        )
     result = rebuild_local_matrix_repairs(
         records=records,
         base_csv=args.base_csv,

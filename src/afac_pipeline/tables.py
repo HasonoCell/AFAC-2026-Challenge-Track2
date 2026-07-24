@@ -136,6 +136,64 @@ def table_to_markdown(table: MarkdownTable) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def repair_split_numeric_pipe_cells(text: str) -> str:
+    """Rejoin OCR decimal fragments that became separate pipe-table cells.
+
+    A standalone ``.02`` or a number ending in ``.`` is not a valid financial
+    table value.  Removing the fragment cell and appending an empty cell keeps
+    the row width fixed while restoring the downstream column alignment.
+    """
+
+    output: list[str] = []
+    for original in text.splitlines(keepends=True):
+        stripped = original.strip()
+        if (
+            not stripped.startswith("|")
+            or _is_separator_line(stripped)
+        ):
+            output.append(original)
+            continue
+        cells = _split_pipe_row(stripped)
+        changed = False
+        index = 1
+        while index < len(cells):
+            current = cells[index].strip()
+            previous = cells[index - 1].strip()
+            if (
+                re.fullmatch(r"\.\d{1,3}", current)
+                and re.fullmatch(r"\d{1,3}(?:,\d{3})*|\d+", previous)
+            ):
+                cells[index - 1] = previous + current
+                cells.pop(index)
+                cells.append("")
+                changed = True
+                continue
+            if re.fullmatch(r"\d{1,2}", current):
+                previous_index = index - 1
+                while (
+                    previous_index > 0
+                    and not cells[previous_index].strip()
+                    and index - previous_index <= 2
+                ):
+                    previous_index -= 1
+                prefix = cells[previous_index].strip()
+                if re.fullmatch(r"(?:\d+|\d{1,3}(?:,\d{3})*)\.", prefix):
+                    cells[previous_index] = prefix + current
+                    removed = index - previous_index
+                    del cells[previous_index + 1 : index + 1]
+                    cells.extend("" for _ in range(removed))
+                    changed = True
+                    index = previous_index + 1
+                    continue
+            index += 1
+        if not changed:
+            output.append(original)
+            continue
+        line_ending = "\n" if original.endswith("\n") else ""
+        output.append(_format_pipe_row(tuple(cells)) + line_ending)
+    return "".join(output)
+
+
 def retain_complete_pipe_table_rows(text: str, *, max_bytes: int) -> str:
     """Fit one or more pipe tables into a UTF-8 budget without broken rows.
 

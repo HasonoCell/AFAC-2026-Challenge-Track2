@@ -7,6 +7,7 @@ import json
 import math
 import re
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -28,6 +29,7 @@ from .images import (
     make_content_grid_slices,
     make_grid_slices,
     make_vertical_slices,
+    image_dimensions,
     profile_image,
 )
 from .local_ocr import (
@@ -38,8 +40,15 @@ from .local_ocr import (
 from .merge import merge_sliced_markdown
 from .pipeline import write_errors, write_submission
 from .submission import _read_submission_rows
-from .tables import html_tables_to_markdown, parse_table, retain_complete_pipe_table_rows
-from .vision import render_observations_in_reading_order
+from .tables import (
+    MarkdownTable,
+    html_tables_to_markdown,
+    parse_table,
+    repair_split_numeric_pipe_cells,
+    retain_complete_pipe_table_rows,
+    table_to_markdown,
+)
+from .vision import VisionMatrixResult, render_observations_in_reading_order
 
 
 BASELINE_CACHE_SCHEMA_VERSION = 12
@@ -96,10 +105,25 @@ class BaselineConfig:
     table_local_ocr_backend: str = "off"
     table_local_ocr_min_pixels: int = 100_000_000
     table_local_ocr_max_pixels: int = 0
+    # A mostly blank, very large actuarial page may still contain one dense
+    # matrix whose remote result silently skips a consecutive row band.
+    # Presets may extend the ordinary area ceiling only when the existing
+    # pipe table itself proves such a material sequence gap.
+    table_local_ocr_huge_page_min_pixels: int = 0
+    table_local_ocr_huge_min_sequence_gap: int = 0
     table_local_ocr_trigger_max_chars: int = 0
     # A dense but partial table can contain more than a thousand characters;
     # compare OCR text to visible ink as a second, scale-independent trigger.
     table_local_ocr_trigger_max_chars_per_content_pixel: float = 0.0
+    # Small but dense actuarial pages need narrower local OCR tiles than
+    # 30--100MP pages. Keep this geometry local to the CPU fallback so the
+    # independently frozen remote repair route and its caches do not change.
+    table_local_ocr_small_page_max_pixels: int = 0
+    table_local_ocr_small_target_tile_width: int = 0
+    table_local_ocr_small_target_tile_height: int = 0
+    table_local_ocr_small_content_scale: float = 0.04
+    table_local_ocr_small_content_padding: int = 200
+    table_local_ocr_y_overlap: int = 0
     table_local_ocr_workers: int = 4
     table_local_ocr_refine_saturated: bool = False
     table_local_ocr_max_refine_depth: int = 1
@@ -241,11 +265,34 @@ def run_baseline_submission(
         raise ValueError(
             "table_local_ocr_max_pixels must be >= table_local_ocr_min_pixels"
         )
+    if config.table_local_ocr_huge_page_min_pixels < 0:
+        raise ValueError("table_local_ocr_huge_page_min_pixels must be >= 0")
+    if config.table_local_ocr_huge_min_sequence_gap < 0:
+        raise ValueError("table_local_ocr_huge_min_sequence_gap must be >= 0")
     if config.table_local_ocr_trigger_max_chars < 0:
         raise ValueError("table_local_ocr_trigger_max_chars must be >= 0")
     if config.table_local_ocr_trigger_max_chars_per_content_pixel < 0:
         raise ValueError(
             "table_local_ocr_trigger_max_chars_per_content_pixel must be >= 0"
+        )
+    if config.table_local_ocr_small_page_max_pixels < 0:
+        raise ValueError("table_local_ocr_small_page_max_pixels must be >= 0")
+    if config.table_local_ocr_small_target_tile_width < 0:
+        raise ValueError("table_local_ocr_small_target_tile_width must be >= 0")
+    if config.table_local_ocr_small_target_tile_height < 0:
+        raise ValueError("table_local_ocr_small_target_tile_height must be >= 0")
+    if config.table_local_ocr_small_content_scale <= 0:
+        raise ValueError("table_local_ocr_small_content_scale must be > 0")
+    if config.table_local_ocr_small_content_padding < 0:
+        raise ValueError("table_local_ocr_small_content_padding must be >= 0")
+    if config.table_local_ocr_y_overlap < 0:
+        raise ValueError("table_local_ocr_y_overlap must be >= 0")
+    if config.table_local_ocr_small_page_max_pixels and (
+        not config.table_local_ocr_small_target_tile_width
+        or not config.table_local_ocr_small_target_tile_height
+    ):
+        raise ValueError(
+            "small-page local OCR requires positive target tile dimensions"
         )
     if config.table_local_ocr_workers < 1:
         raise ValueError("table_local_ocr_workers must be >= 1")
@@ -428,20 +475,21 @@ def rebuild_cached_local_matrix_repairs(
         ):
             continue
         image_bytes = record.read_bytes()
-        repair_rows, repair_cols = _table_repair_grid(image_bytes, config)
+        local_config = _local_matrix_geometry_config(image_bytes, config)
+        repair_rows, repair_cols = _table_repair_grid(image_bytes, local_config)
         slices = make_content_grid_slices(
             file_name=record.file_name,
             image_bytes=image_bytes,
             rows=repair_rows,
             cols=repair_cols,
-            threshold=config.table_repair_content_threshold,
-            sample_scale=config.table_repair_content_scale,
-            padding=config.table_repair_content_padding,
+            threshold=local_config.table_repair_content_threshold,
+            sample_scale=local_config.table_repair_content_scale,
+            padding=local_config.table_repair_content_padding,
             x_overlap=0,
-            y_overlap=0,
+            y_overlap=local_config.table_local_ocr_y_overlap,
             header_context_height=0,
             left_context_width=0,
-            jpeg_quality=config.jpeg_quality,
+            jpeg_quality=local_config.jpeg_quality,
         )
         record_cache_dir = local_cache_root / Path(record.file_name).stem
         tile_cache_dir = record_cache_dir / "rapidocr-v4" / "tiles"
@@ -469,6 +517,18 @@ def rebuild_cached_local_matrix_repairs(
         if result is None:
             continue
         candidate_markdown = _local_matrix_candidate_markdown(result.markdown, config)
+        candidate_markdown = _merge_previous_sequence_table_cells(
+            base[record.file_name],
+            candidate_markdown,
+        )
+        candidate_markdown = _preserve_pipe_table_context(
+            base[record.file_name],
+            candidate_markdown,
+        )
+        candidate_markdown = _preserve_repeated_table_metadata(
+            base[record.file_name],
+            candidate_markdown,
+        )
         issue = _table_candidate_issue(candidate_markdown, config)
         if issue is not None:
             print(
@@ -476,11 +536,11 @@ def rebuild_cached_local_matrix_repairs(
             )
             continue
         base_markdown = base[record.file_name]
-        if not _repair_is_better(
+        if not _local_matrix_repair_is_better(
             base_markdown,
             candidate_markdown,
-            config.table_repair_min_gain,
-            max_duplicate_line_ratio=config.table_max_duplicate_line_ratio,
+            result=result,
+            config=config,
         ):
             continue
         selected_rows.append(
@@ -803,24 +863,31 @@ def _maybe_local_matrix_repair(
     ):
         return None
     image_bytes = record.read_bytes()
-    repair_rows, repair_cols = _table_repair_grid(image_bytes, config)
+    local_config = _local_matrix_geometry_config(image_bytes, config)
+    repair_rows, repair_cols = _table_repair_grid(image_bytes, local_config)
     slices = make_content_grid_slices(
         file_name=record.file_name,
         image_bytes=image_bytes,
         rows=repair_rows,
         cols=repair_cols,
-        threshold=config.table_repair_content_threshold,
-        sample_scale=config.table_repair_content_scale,
-        padding=config.table_repair_content_padding,
+        threshold=local_config.table_repair_content_threshold,
+        sample_scale=local_config.table_repair_content_scale,
+        padding=local_config.table_repair_content_padding,
         x_overlap=0,
-        y_overlap=0,
+        y_overlap=local_config.table_local_ocr_y_overlap,
         header_context_height=0,
         left_context_width=0,
-        jpeg_quality=config.jpeg_quality,
+        jpeg_quality=local_config.jpeg_quality,
     )
     cache_dir = (
         config.cache_dir
-        / _baseline_cache_namespace(config, f"local_{config.table_local_ocr_backend}_matrix")
+        # Raw OCR cache identity follows the *effective* tile geometry. For a
+        # large page, merely enabling the small-page alternative must not
+        # invalidate an otherwise identical v6 cache.
+        / _baseline_cache_namespace(
+            local_config,
+            f"local_{config.table_local_ocr_backend}_matrix",
+        )
         / Path(record.file_name).stem
     )
     try:
@@ -846,6 +913,18 @@ def _maybe_local_matrix_repair(
         )
         return None
     candidate_markdown = _local_matrix_candidate_markdown(result.markdown, config)
+    candidate_markdown = _merge_previous_sequence_table_cells(
+        previous_markdown,
+        candidate_markdown,
+    )
+    candidate_markdown = _preserve_pipe_table_context(
+        previous_markdown,
+        candidate_markdown,
+    )
+    candidate_markdown = _preserve_repeated_table_metadata(
+        previous_markdown,
+        candidate_markdown,
+    )
     issue = _table_candidate_issue(candidate_markdown, config)
     if issue is not None:
         print(
@@ -853,11 +932,11 @@ def _maybe_local_matrix_repair(
             f"{record.file_name}: {issue}"
         )
         return None
-    if not _repair_is_better(
+    if not _local_matrix_repair_is_better(
         previous_markdown,
         candidate_markdown,
-        config.table_repair_min_gain,
-        max_duplicate_line_ratio=config.table_max_duplicate_line_ratio,
+        result=result,
+        config=config,
     ):
         return None
     print(
@@ -882,6 +961,13 @@ def _should_attempt_local_matrix_repair(
         return False
     if config.table_local_ocr_max_pixels and pixels > config.table_local_ocr_max_pixels:
         return False
+    if (
+        config.table_local_ocr_huge_page_min_pixels
+        and pixels >= config.table_local_ocr_huge_page_min_pixels
+        and _largest_pipe_numeric_sequence_gap(previous_markdown)
+        < config.table_local_ocr_huge_min_sequence_gap
+    ):
+        return False
 
     within_char_limit = (
         not config.table_local_ocr_trigger_max_chars
@@ -893,6 +979,32 @@ def _should_attempt_local_matrix_repair(
         <= config.table_local_ocr_trigger_max_chars_per_content_pixel
     )
     return within_char_limit or within_content_density_limit
+
+
+def _local_matrix_geometry_config(
+    image_bytes: bytes,
+    config: BaselineConfig,
+) -> BaselineConfig:
+    """Select local-only tile geometry from observable page area.
+
+    A single global tile width made the 15MP route use the 30--100MP geometry:
+    each tile then contained too many OCR candidates and could take minutes
+    without completing. The alternative remains disabled unless a frozen
+    preset supplies a page-area boundary and both target dimensions.
+    """
+
+    if not config.table_local_ocr_small_page_max_pixels:
+        return config
+    width, height = image_dimensions(image_bytes=image_bytes)
+    if width * height > config.table_local_ocr_small_page_max_pixels:
+        return config
+    return replace(
+        config,
+        table_repair_target_tile_width=config.table_local_ocr_small_target_tile_width,
+        table_repair_target_tile_height=config.table_local_ocr_small_target_tile_height,
+        table_repair_content_scale=config.table_local_ocr_small_content_scale,
+        table_repair_content_padding=config.table_local_ocr_small_content_padding,
+    )
 
 
 def _call_table_content_grid_record(
@@ -2105,7 +2217,9 @@ def _serialize_output_tables(markdown: str, config: BaselineConfig) -> str:
 
     if config.table_output_format == "html":
         return markdown
-    return html_tables_to_markdown(markdown)
+    return repair_split_numeric_pipe_cells(
+        html_tables_to_markdown(markdown)
+    )
 
 
 def _local_matrix_candidate_markdown(markdown: str, config: BaselineConfig) -> str:
@@ -2118,6 +2232,379 @@ def _local_matrix_candidate_markdown(markdown: str, config: BaselineConfig) -> s
             max_bytes=config.table_local_ocr_max_output_bytes,
         )
     return candidate
+
+
+def _preserve_pipe_table_context(previous: str, repaired: str) -> str:
+    """Keep trusted remote prose around a compatible local table repair.
+
+    Local CPU OCR is selected for its coordinate lattice, not because it is a
+    stronger recognizer for titles, units, or explanatory prose.  If both
+    documents contain exactly one complete pipe table with the same header,
+    retain the previous prefix and suffix and replace only the table.
+    """
+
+    previous_parts = _single_pipe_table_parts(previous)
+    repaired_parts = _single_pipe_table_parts(repaired)
+    if previous_parts is None or repaired_parts is None:
+        return repaired
+    previous_prefix, previous_table_text, previous_suffix = previous_parts
+    _, repaired_table_text, _ = repaired_parts
+    repaired_table = parse_table(repaired_table_text)
+    previous_header = tuple(
+        cell.strip()
+        for cell in previous_table_text.splitlines()[0].strip().strip("|").split("|")
+    )
+    if repaired_table is None or not _compatible_pipe_table_headers(
+        previous_header,
+        repaired_table.header,
+    ):
+        return repaired
+
+    parts = [
+        part
+        for part in (
+            previous_prefix.strip(),
+            repaired_table_text.strip(),
+            previous_suffix.strip(),
+        )
+        if part
+    ]
+    return "\n\n".join(parts).strip() + "\n"
+
+
+def _compatible_pipe_table_headers(
+    previous: tuple[str, ...],
+    repaired: tuple[str, ...],
+) -> bool:
+    if previous == repaired:
+        return True
+    if not previous or not repaired:
+        return False
+    previous_axis = [
+        int(cell) for cell in previous[1:] if re.fullmatch(r"\d{1,3}", cell)
+    ]
+    repaired_axis = [
+        int(cell) for cell in repaired[1:] if re.fullmatch(r"\d{1,3}", cell)
+    ]
+    previous_label = re.sub(r"\s+", "", previous[0])
+    repaired_label = re.sub(r"\s+", "", repaired[0])
+    return (
+        len(previous_axis) >= 4
+        and previous_axis == repaired_axis
+        and len(previous_label) >= 4
+        and (
+            previous_label in repaired_label
+            or repaired_label in previous_label
+        )
+    )
+
+
+def _merge_previous_sequence_table_cells(previous: str, repaired: str) -> str:
+    """Use local OCR to fill a sequence gap without degrading existing cells."""
+
+    if _largest_pipe_numeric_sequence_gap(previous) < 3:
+        return repaired
+    previous_parts = _single_pipe_table_parts(previous)
+    repaired_parts = _single_pipe_table_parts(repaired)
+    if previous_parts is None or repaired_parts is None:
+        return repaired
+    previous_prefix, previous_table_text, previous_suffix = previous_parts
+    _, repaired_table_text, _ = repaired_parts
+    repaired_table = parse_table(repaired_table_text)
+    if repaired_table is None:
+        return repaired
+    width = len(repaired_table.header)
+    previous_lines = [
+        line
+        for line in previous_table_text.splitlines()
+        if line.lstrip().startswith("|")
+    ]
+    if not previous_lines:
+        return repaired
+    previous_header = tuple(
+        cell.strip()
+        for cell in previous_lines[0].strip().strip("|").split("|")
+    )
+    if previous_header != repaired_table.header:
+        return repaired
+
+    previous_rows: dict[int, tuple[str, ...]] = {}
+    previous_keys: set[int] = set()
+    for line in previous_lines[1:]:
+        if _is_pipe_separator(line):
+            continue
+        cells = tuple(
+            cell.strip() for cell in line.strip().strip("|").split("|")
+        )
+        if not cells or len(cells) > width or not re.fullmatch(r"\d{1,3}", cells[0]):
+            continue
+        key = int(cells[0])
+        if key in previous_keys:
+            return repaired
+        previous_keys.add(key)
+        previous_rows[key] = cells
+    if len(previous_rows) < 12:
+        return repaired
+
+    repaired_table = _normalize_local_thousands_separators(repaired_table)
+    repaired_keys = [
+        int(row[0]) if re.fullmatch(r"\d{1,3}", row[0]) else None
+        for row in repaired_table.rows
+    ]
+    if (
+        any(key is None for key in repaired_keys)
+        or len(set(repaired_keys)) != len(repaired_keys)
+        or not previous_keys.issubset(set(repaired_keys))
+    ):
+        return repaired
+    merged_rows = []
+    for key, repaired_row in zip(repaired_keys, repaired_table.rows, strict=True):
+        previous_row = previous_rows.get(key)
+        if previous_row is None:
+            merged_rows.append(repaired_row)
+            continue
+        if len(previous_row) != width:
+            merged_rows.append(
+                _merge_partial_sequence_row(previous_row, repaired_row)
+            )
+            continue
+        merged_rows.append(
+            tuple(
+                previous_cell or repaired_cell
+                for previous_cell, repaired_cell in zip(
+                    previous_row,
+                    repaired_row,
+                    strict=True,
+                )
+            )
+        )
+    merged_table = table_to_markdown(
+        MarkdownTable(
+            header=repaired_table.header,
+            rows=tuple(merged_rows),
+            header_is_explicit=repaired_table.header_is_explicit,
+        )
+    )
+    parts = [
+        part
+        for part in (
+            previous_prefix.strip(),
+            merged_table.strip(),
+            previous_suffix.strip(),
+        )
+        if part
+    ]
+    return "\n\n".join(parts).strip() + "\n"
+
+
+def _merge_partial_sequence_row(
+    previous_row: tuple[str, ...],
+    repaired_row: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Align a short remote row to a fixed-width local coordinate row."""
+
+    merged = list(repaired_row)
+    previous_values = [
+        value for value in previous_row[1:] if value.strip()
+    ]
+    repaired_positions = [
+        index for index, value in enumerate(repaired_row[1:], start=1) if value.strip()
+    ]
+    repaired_values = [repaired_row[index] for index in repaired_positions]
+
+    def normalized(value: str) -> str:
+        compact = re.sub(r"\s+", "", value)
+        if re.fullmatch(r"\d{1,3}[.,]\d{3}", compact):
+            return compact.replace(",", "").replace(".", "")
+        return compact
+
+    left = [normalized(value) for value in previous_values]
+    right = [normalized(value) for value in repaired_values]
+    scores = [[0] * (len(right) + 1) for _ in range(len(left) + 1)]
+    for row in range(len(left) - 1, -1, -1):
+        for column in range(len(right) - 1, -1, -1):
+            scores[row][column] = (
+                1 + scores[row + 1][column + 1]
+                if left[row] == right[column]
+                else max(scores[row + 1][column], scores[row][column + 1])
+            )
+    matches: list[tuple[int, int]] = []
+    row = column = 0
+    while row < len(left) and column < len(right):
+        if left[row] == right[column]:
+            matches.append((row, repaired_positions[column]))
+            row += 1
+            column += 1
+        elif scores[row + 1][column] >= scores[row][column + 1]:
+            row += 1
+        else:
+            column += 1
+
+    if len(matches) >= max(3, math.ceil(len(previous_values) * 0.50)):
+        for previous_index, repaired_position in matches:
+            merged[repaired_position] = previous_values[previous_index]
+        anchors = [(-1, 0), *matches, (len(previous_values), len(repaired_row))]
+        for (previous_left, repaired_left), (previous_right, repaired_right) in zip(
+            anchors,
+            anchors[1:],
+        ):
+            pending = previous_values[previous_left + 1 : previous_right]
+            available = [
+                index
+                for index in range(repaired_left + 1, repaired_right)
+                if not merged[index]
+            ]
+            for value, position in zip(pending, available):
+                merged[position] = value
+        return tuple(merged)
+
+    # When too few coordinate anchors agree, the remote fragment is still
+    # substantially cleaner text. Its row-major renderer starts at the first
+    # visible value column, so retain that prefix and leave any additional
+    # local tail in place.
+    if len(previous_values) >= 5:
+        for value, position in zip(previous_values, range(1, len(merged))):
+            merged[position] = value
+        return tuple(merged)
+    return repaired_row
+
+
+def _normalize_local_thousands_separators(table: MarkdownTable) -> MarkdownTable:
+    """Use a column's dominant thousands style to repair OCR punctuation."""
+
+    rows = [list(row) for row in table.rows]
+    for column in range(len(table.header)):
+        values = [row[column].strip() for row in rows if row[column].strip()]
+        comma_count = sum(
+            bool(re.fullmatch(r"\d{1,3}(?:,\d{3})+", value))
+            for value in values
+        )
+        dot_count = sum(
+            bool(re.fullmatch(r"\d{1,3}(?:\.\d{3})+", value))
+            for value in values
+        )
+        if comma_count < 10 or comma_count < dot_count * 3:
+            continue
+        for row in rows:
+            if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", row[column].strip()):
+                row[column] = row[column].replace(".", ",")
+    return MarkdownTable(
+        header=table.header,
+        rows=tuple(tuple(row) for row in rows),
+        header_is_explicit=table.header_is_explicit,
+    )
+
+
+def _single_pipe_table_parts(text: str) -> tuple[str, str, str] | None:
+    """Split one logical pipe table, allowing blank-separated fragments."""
+
+    lines = text.splitlines(keepends=True)
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index + 1 < len(lines):
+        if (
+            not lines[index].lstrip().startswith("|")
+            or not _is_pipe_separator(lines[index + 1])
+        ):
+            index += 1
+            continue
+        end = index + 2
+        while end < len(lines) and lines[end].lstrip().startswith("|"):
+            end += 1
+        spans.append((index, end))
+        index = end
+    if not spans or any(
+        "".join(lines[previous_end:current_start]).strip()
+        for (_, previous_end), (current_start, _) in zip(spans, spans[1:])
+    ):
+        return None
+    start, end = spans[0][0], spans[-1][1]
+    table_text = "".join(lines[start:end])
+    return "".join(lines[:start]), table_text, "".join(lines[end:])
+
+
+def _largest_pipe_numeric_sequence_gap(markdown: str) -> int:
+    """Return the largest missing run in a strongly sequential first column."""
+
+    largest_gap = 0
+    for block in re.split(r"\n(?!\s*\|)", markdown):
+        keys: list[int] = []
+        for line in block.splitlines():
+            if not line.lstrip().startswith("|") or _is_pipe_separator(line):
+                continue
+            first = line.strip().strip("|").split("|", 1)[0].strip()
+            if re.fullmatch(r"\d{1,3}", first):
+                keys.append(int(first))
+        if len(keys) < 12:
+            continue
+        positive_deltas = [
+            current - previous
+            for previous, current in zip(keys, keys[1:])
+            if current > previous
+        ]
+        unit_steps = sum(delta == 1 for delta in positive_deltas)
+        if (
+            unit_steps < 10
+            or unit_steps < math.ceil(len(positive_deltas) * 0.60)
+        ):
+            continue
+        largest_gap = max(
+            largest_gap,
+            max((delta - 1 for delta in positive_deltas), default=0),
+        )
+    return largest_gap
+
+
+def _preserve_repeated_table_metadata(previous: str, repaired: str) -> str:
+    """Keep a stronger repeated metadata token from the existing table."""
+
+    previous_table = parse_table(previous)
+    repaired_table = parse_table(repaired)
+    if (
+        previous_table is None
+        or repaired_table is None
+        or len(previous_table.header) != len(repaired_table.header)
+    ):
+        return repaired
+    previous_rows = (previous_table.header, *previous_table.rows)
+    repaired_rows = [list(repaired_table.header), *map(list, repaired_table.rows)]
+    replacements: dict[int, tuple[str, str]] = {}
+    for column in range(len(repaired_table.header)):
+        previous_values = [row[column] for row in previous_rows if row[column]]
+        repaired_values = [row[column] for row in repaired_rows if row[column]]
+        if len(previous_values) < 10 or len(repaired_values) < 10:
+            continue
+        previous_mode, previous_count = Counter(previous_values).most_common(1)[0]
+        repaired_mode, repaired_count = Counter(repaired_values).most_common(1)[0]
+        if (
+            _numeric_value_for_metadata(previous_mode)
+            or _numeric_value_for_metadata(repaired_mode)
+            or previous_count < math.ceil(len(previous_values) * 0.70)
+            or repaired_count < math.ceil(len(repaired_values) * 0.70)
+            or previous_mode == repaired_mode
+            or repaired_mode not in previous_mode
+        ):
+            continue
+        replacements[column] = (repaired_mode, previous_mode)
+    if not replacements:
+        return repaired
+    for row in repaired_rows:
+        for column, (old, new) in replacements.items():
+            if row[column] == old:
+                row[column] = new
+    return table_to_markdown(
+        MarkdownTable(
+            header=tuple(repaired_rows[0]),
+            rows=tuple(tuple(row) for row in repaired_rows[1:]),
+            header_is_explicit=repaired_table.header_is_explicit,
+        )
+    )
+
+
+def _numeric_value_for_metadata(text: str) -> bool:
+    """Small local helper avoiding a dependency on vision's OCR normalizer."""
+
+    return bool(re.fullmatch(r"[+-]?\d+(?:[.,]\d+)?", text.strip()))
 
 
 def _build_output_rows(
@@ -2368,6 +2855,211 @@ def _raise_if_repair_part_repeats(
             f"{counts[digest]} tiles",
             calls=calls,
         )
+
+
+def _local_matrix_repair_is_better(
+    previous: str,
+    repaired: str,
+    *,
+    result: VisionMatrixResult,
+    config: BaselineConfig,
+) -> bool:
+    """Prefer a strongly proven coordinate lattice over a malformed big table.
+
+    The generic table score rewards raw cell count.  That is appropriate for
+    remote candidates, but a single over-wide row created by tile seams can
+    outscore two exact coordinate matrices.  Local OCR has stronger evidence:
+    coverage plus independently aligned header and row sequences.  Use that
+    evidence only for near-complete matrices with a dense header axis.
+    """
+
+    # A cash-value matrix labelled by policy year / age cannot have a negative
+    # age axis.  When tiled OCR returns one, it is a coordinate-seam artifact
+    # (usually an extra value fragment at the left edge), not a valid table
+    # reconstruction.  Reject it before the generic cell-count score can
+    # reward the otherwise large but misaligned matrix.  This is deliberately
+    # driven by the printed semantic label, rather than a document identity.
+    if _has_impossible_negative_policy_axis(repaired, result=result):
+        return False
+
+    if _repair_is_better(
+        previous,
+        repaired,
+        config.table_repair_min_gain,
+        max_duplicate_line_ratio=config.table_max_duplicate_line_ratio,
+    ):
+        return True
+    if _local_matrix_repairs_split_numeric_fragments(
+        previous,
+        repaired,
+        result=result,
+    ):
+        return True
+    if _local_matrix_repairs_malformed_numeric_header(
+        previous,
+        repaired,
+        result=result,
+    ):
+        return True
+    if len(repaired.strip()) < len(previous.strip()) + config.table_repair_min_gain:
+        return False
+    if (
+        config.table_max_duplicate_line_ratio >= 0
+        and _duplicate_line_ratio(repaired) > config.table_max_duplicate_line_ratio
+    ):
+        return False
+    if (
+        result.table_count < 1
+        or result.rows < result.table_count * 4
+        or result.cols < 5
+        or result.coverage < 0.90
+    ):
+        return False
+    expected_header_cells = (result.cols - 1) * result.table_count
+    if expected_header_cells <= 0:
+        return False
+    if result.header_sequence_inliers < math.ceil(expected_header_cells * 0.80):
+        return False
+    # At least half the row-axis positions must be observed exactly. A paired
+    # table repaired through a strong sibling may contribute only one inlier,
+    # but the sibling itself supplies the remainder.
+    if result.row_sequence_inliers < math.ceil(result.rows * 0.50):
+        return False
+    return True
+
+
+def _has_impossible_negative_policy_axis(
+    markdown: str,
+    *,
+    result: VisionMatrixResult,
+) -> bool:
+    """Detect a seam-created negative axis on a policy year / age matrix."""
+
+    if not any(start < 0 for start in result.header_starts):
+        return False
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|") or "---" in stripped:
+            continue
+        header_cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if not header_cells:
+            continue
+        label = re.sub(r"\s+", "", header_cells[0])
+        if not ("年度" in label and "年龄" in label):
+            continue
+        numeric_axis = [
+            int(cell)
+            for cell in header_cells[1:]
+            if re.fullmatch(r"-?\d{1,3}", cell)
+        ]
+        if numeric_axis and min(numeric_axis) < 0:
+            return True
+    return False
+
+
+def _local_matrix_repairs_split_numeric_fragments(
+    previous: str,
+    repaired: str,
+    *,
+    result: VisionMatrixResult,
+) -> bool:
+    """Accept an equal-shape lattice that rejoins systematic decimal splits."""
+
+    previous_table = _parse_single_pipe_table_document(previous)
+    repaired_table = _parse_single_pipe_table_document(repaired)
+    if (
+        previous_table is None
+        or repaired_table is None
+        or previous_table.header != repaired_table.header
+        or len(previous_table.rows) != len(repaired_table.rows)
+        or len(previous_table.header) != len(repaired_table.header)
+        or result.rows != len(repaired_table.rows)
+        or result.cols != len(repaired_table.header)
+        or result.coverage < 0.70
+        or result.row_sequence_inliers < math.ceil(result.rows * 0.80)
+    ):
+        return False
+
+    def fragment_count(table: MarkdownTable) -> int:
+        return sum(
+            bool(re.fullmatch(r"(?:\d+\.|\.\d+)", cell.strip()))
+            for row in (table.header, *table.rows)
+            for cell in row
+        )
+
+    previous_fragments = fragment_count(previous_table)
+    repaired_fragments = fragment_count(repaired_table)
+    required_reduction = max(5, math.ceil(result.rows * 0.20))
+    return previous_fragments - repaired_fragments >= required_reduction
+
+
+def _local_matrix_repairs_malformed_numeric_header(
+    previous: str,
+    repaired: str,
+    *,
+    result: VisionMatrixResult,
+) -> bool:
+    """Accept an exact local lattice when remote header cells were split.
+
+    A remote table can retain the correct data-row count while inserting blank
+    columns between the numeric header labels.  Raw character and cell counts
+    then favour the malformed wider table.  A nearly complete coordinate
+    lattice with independently proven contiguous header and row axes is
+    stronger evidence than those inflated counts.
+    """
+
+    previous_table = _parse_single_pipe_table_document(previous)
+    repaired_table = _parse_single_pipe_table_document(repaired)
+    if (
+        previous_table is None
+        or repaired_table is None
+        or result.table_count != 1
+        or result.rows < 10
+        or result.cols < 5
+        or len(repaired_table.rows) != result.rows
+        or len(repaired_table.header) != result.cols
+        or result.coverage < 0.97
+        or result.header_sequence_inliers < result.cols - 1
+        or result.row_sequence_inliers < math.ceil(result.rows * 0.90)
+        or len(repaired.strip()) < len(previous.strip()) * 0.75
+    ):
+        return False
+
+    repaired_axis = [
+        int(cell.strip())
+        for cell in repaired_table.header[1:]
+        if re.fullmatch(r"\d{1,3}", cell.strip())
+    ]
+    if (
+        len(repaired_axis) != result.cols - 1
+        or repaired_axis
+        != list(range(repaired_axis[0], repaired_axis[0] + len(repaired_axis)))
+    ):
+        return False
+
+    previous_axis = previous_table.header[1:]
+    numeric_previous = [
+        int(cell.strip())
+        for cell in previous_axis
+        if re.fullmatch(r"\d{1,3}", cell.strip())
+    ]
+    internal_blank = any(
+        not cell.strip()
+        and any(later.strip() for later in previous_axis[index + 1 :])
+        for index, cell in enumerate(previous_axis)
+    )
+    return (
+        internal_blank
+        and len(numeric_previous) >= 4
+        and len(previous_table.header) > len(repaired_table.header)
+    )
+
+
+def _parse_single_pipe_table_document(text: str) -> MarkdownTable | None:
+    parts = _single_pipe_table_parts(text)
+    if parts is None:
+        return None
+    return parse_table(parts[1])
 
 
 def _repair_is_better(
@@ -2667,6 +3359,7 @@ def _baseline_cache_namespace(config: BaselineConfig, strategy: str) -> str:
                     "table_repair_content_threshold": config.table_repair_content_threshold,
                     "table_repair_content_scale": config.table_repair_content_scale,
                     "table_repair_content_padding": config.table_repair_content_padding,
+                    "table_local_ocr_y_overlap": config.table_local_ocr_y_overlap,
                 }
             )
         else:
@@ -2714,8 +3407,15 @@ def _baseline_cache_namespace(config: BaselineConfig, strategy: str) -> str:
             "table_local_ocr_backend": config.table_local_ocr_backend,
             "table_local_ocr_min_pixels": config.table_local_ocr_min_pixels,
             "table_local_ocr_max_pixels": config.table_local_ocr_max_pixels,
+            "table_local_ocr_huge_page_min_pixels": config.table_local_ocr_huge_page_min_pixels,
+            "table_local_ocr_huge_min_sequence_gap": config.table_local_ocr_huge_min_sequence_gap,
             "table_local_ocr_trigger_max_chars": config.table_local_ocr_trigger_max_chars,
             "table_local_ocr_trigger_max_chars_per_content_pixel": config.table_local_ocr_trigger_max_chars_per_content_pixel,
+            "table_local_ocr_small_page_max_pixels": config.table_local_ocr_small_page_max_pixels,
+            "table_local_ocr_small_target_tile_width": config.table_local_ocr_small_target_tile_width,
+            "table_local_ocr_small_target_tile_height": config.table_local_ocr_small_target_tile_height,
+            "table_local_ocr_small_content_scale": config.table_local_ocr_small_content_scale,
+            "table_local_ocr_small_content_padding": config.table_local_ocr_small_content_padding,
             "table_local_ocr_refine_saturated": config.table_local_ocr_refine_saturated,
             "table_local_ocr_max_refine_depth": config.table_local_ocr_max_refine_depth,
             "table_anchor_max_candidates": config.table_anchor_max_candidates,

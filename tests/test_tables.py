@@ -8,6 +8,7 @@ from afac_pipeline.tables import (
     parse_html_table,
     parse_markdown_pipe_table,
     parse_sliced_table,
+    repair_split_numeric_pipe_cells,
     table_to_html,
     table_to_markdown,
     retain_complete_pipe_table_rows,
@@ -35,6 +36,23 @@ def _slice(row: int, col: int, rows: int, cols: int) -> ImageSlice:
 
 
 class MarkdownTableTest(unittest.TestCase):
+    def test_repairs_decimal_fragments_without_changing_row_width(self) -> None:
+        source = (
+            "| A | B | C | D | E | F |\n"
+            "| --- | --- | --- | --- | --- | --- |\n"
+            "| 1 | 441 | .02 | 5677. |  | 84 |\n"
+        )
+
+        repaired = repair_split_numeric_pipe_cells(source)
+
+        table = parse_markdown_pipe_table(repaired)
+        self.assertIsNotNone(table)
+        assert table is not None
+        self.assertEqual(
+            table.rows,
+            (("1", "441.02", "5677.84", "", "", ""),),
+        )
+
     def test_row_budget_keeps_header_and_complete_rows(self) -> None:
         source = "标题\n| A | B |\n| --- | --- |\n| 一 | 二 |\n| 三 | 四 |\n"
         compact = retain_complete_pipe_table_rows(
