@@ -5,10 +5,13 @@ import unittest
 from afac_pipeline.tables import parse_table
 from afac_pipeline.vision import (
     VisionObservation,
+    _collapse_phantom_split_numeric_column,
     _contiguous_row_centers,
     _merge_split_numeric_fragments,
     _numeric_value,
+    _normalize_dominant_metadata_columns,
     _normalize_numeric_text,
+    _normalize_repeated_zero_decimal_columns,
     render_observations_in_reading_order,
     reconstruct_numeric_matrix_from_observations,
 )
@@ -61,6 +64,34 @@ class VisionMatrixTest(unittest.TestCase):
 
         self.assertEqual(len(merged), 402)
         self.assertEqual(sum(item.text == "12.34" for item in merged), 400)
+
+    def test_merges_one_off_decimal_fragments_on_the_same_baseline(self) -> None:
+        observations = [
+            VisionObservation(20, 100, 30, 20, 0.99, "408"),
+            VisionObservation(45, 100, 10, 20, 0.99, "47"),
+            # A normal adjacent cell is much farther away and must remain
+            # independent even though it also contains two digits.
+            VisionObservation(150, 100, 30, 20, 0.99, "26"),
+            *[
+                VisionObservation(
+                    100 + column * 100,
+                    200 + row * 40,
+                    20,
+                    20,
+                    0.99,
+                    str(1_000 + row * 10 + column),
+                )
+                for row in range(3)
+                for column in range(3)
+            ],
+        ]
+
+        merged = _merge_split_numeric_fragments(observations)
+
+        self.assertIn("408.47", {item.text for item in merged})
+        self.assertIn("26", {item.text for item in merged})
+        self.assertNotIn("408", {item.text for item in merged})
+        self.assertNotIn("47", {item.text for item in merged})
 
     def test_row_lattice_tracks_bounded_local_drift_without_reaching_footer(self) -> None:
         candidates = [(100 + index * 10.1, 20) for index in range(500)]
@@ -167,6 +198,54 @@ class VisionMatrixTest(unittest.TestCase):
         self.assertEqual(table.header, ("保单年度\\投保年龄", "1", "2", "3", "4", "5", "6"))
         self.assertEqual(table.rows, tuple(expected_rows))
 
+    def test_reconstructs_split_standalone_age_corner_with_visible_axis(self) -> None:
+        observations = [
+            VisionObservation(130, 100, 60, 16, 0.99, "投保年"),
+            VisionObservation(100, 114, 14, 12, 0.99, "龄"),
+        ]
+        observations.extend(
+            _observation(200 + column * 100, 105, str(10 + column))
+            for column in range(6)
+        )
+        expected_rows = []
+        for row in range(6):
+            values = (str(row + 1), *(str(1_000 + row * 10 + column) for column in range(6)))
+            expected_rows.append(values)
+            observations.extend(
+                _observation(100 + column * 100, 200 + row * 50, value)
+                for column, value in enumerate(values)
+            )
+
+        result = reconstruct_numeric_matrix_from_observations(observations)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        table = parse_table(result.markdown)
+        self.assertIsNotNone(table)
+        assert table is not None
+        self.assertEqual(table.header, ("投保年龄", "10", "11", "12", "13", "14", "15"))
+        self.assertEqual(table.rows, tuple(expected_rows))
+
+    def test_rejects_split_age_words_without_visible_integer_axis(self) -> None:
+        observations = [
+            VisionObservation(130, 100, 60, 16, 0.99, "投保年"),
+            VisionObservation(100, 114, 14, 12, 0.99, "龄"),
+            _observation(200, 105, "10"),
+            _observation(300, 105, "12"),
+            _observation(400, 105, "14"),
+        ]
+        observations.extend(
+            _observation(
+                100 + column * 100,
+                200 + row * 50,
+                str(1_000 + row * 10 + column),
+            )
+            for row in range(6)
+            for column in range(6)
+        )
+
+        self.assertIsNone(reconstruct_numeric_matrix_from_observations(observations))
+
     def test_reconstructs_matrix_with_diagonal_corner_and_annual_axis(self) -> None:
         """A wider corner is valid only when its annual sequence is visible."""
 
@@ -195,6 +274,40 @@ class VisionMatrixTest(unittest.TestCase):
         self.assertIsNotNone(table)
         assert table is not None
         self.assertEqual(table.header, ("保单年度末\\投保年龄", "1", "2", "3", "4", "5"))
+        self.assertEqual(table.rows, tuple(expected_rows))
+
+    def test_reconstructs_matrix_with_plain_age_corner_and_annual_axis(self) -> None:
+        observations = [
+            _observation(180, 130, "年龄"),
+            _observation(100, 100, "保单年度"),
+        ]
+        observations.extend(
+            _observation(200 + column * 100, 100, str(column + 1))
+            for column in range(6)
+        )
+        expected_rows = []
+        for row in range(8):
+            values = (
+                str(row),
+                *(str(1_000 + row * 10 + column) for column in range(6)),
+            )
+            expected_rows.append(values)
+            observations.extend(
+                _observation(100 + column * 100, 200 + row * 50, value)
+                for column, value in enumerate(values)
+            )
+
+        result = reconstruct_numeric_matrix_from_observations(observations)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        table = parse_table(result.markdown)
+        self.assertIsNotNone(table)
+        assert table is not None
+        self.assertEqual(
+            table.header,
+            ("保单年度\\投保年龄", "1", "2", "3", "4", "5", "6"),
+        )
         self.assertEqual(table.rows, tuple(expected_rows))
 
     def test_reconstructs_right_aligned_numeric_columns(self) -> None:
@@ -245,6 +358,184 @@ class VisionMatrixTest(unittest.TestCase):
 
         self.assertIsNone(reconstruct_numeric_matrix_from_observations(observations))
 
+    def test_reconstructs_headerless_sequential_record_table(self) -> None:
+        observations = []
+        term_text = "至被保险人年满105周岁后的首个保单周年日零时止"
+        row_index = 0
+        for group, count in (("2", 60), ("3", 20)):
+            for sequence in range(1, count + 1):
+                y = 100 + row_index * 50
+                values = (
+                    group,
+                    "男性",
+                    "趸交",
+                    term_text,
+                    str(sequence),
+                    f"{600 + sequence}.00",
+                )
+                for column, value in enumerate(values):
+                    if row_index == 29 and column == 5:
+                        continue
+                    observations.append(
+                        _observation(100 + column * 200, y, value)
+                    )
+                if row_index == 29:
+                    observations.extend(
+                        [
+                            _observation(100, y + 20, "C"),
+                            _observation(300, y + 20, "另土"),
+                            _observation(500, y + 20, "足文"),
+                            _observation(900, y + 20, "+C"),
+                            _observation(1100, y + 20, values[5]),
+                        ]
+                    )
+                row_index += 1
+
+        result = reconstruct_numeric_matrix_from_observations(observations)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        table = parse_table(result.markdown)
+        self.assertIsNotNone(table)
+        assert table is not None
+        self.assertEqual(result.rows, 80)
+        self.assertEqual(result.cols, 6)
+        self.assertEqual(table.header[:5], ("2", "男性", "趸交", term_text, "1"))
+        self.assertEqual(table.rows[28][4:], ("30", "630.00"))
+        self.assertEqual(table.rows[-1][0], "3")
+        self.assertEqual(table.rows[-1][4], "20")
+
+    def test_rejects_headerless_records_without_sequence_progression(self) -> None:
+        observations = [
+            _observation(
+                100 + column * 200,
+                100 + row * 50,
+                (
+                    "2",
+                    "男性",
+                    "趸交",
+                    "保险期间",
+                    "7",
+                    f"{600 + row}.00",
+                )[column],
+            )
+            for row in range(40)
+            for column in range(6)
+        ]
+
+        self.assertIsNone(reconstruct_numeric_matrix_from_observations(observations))
+
+    def test_reconstructs_headerless_fixed_gender_age_grid(self) -> None:
+        observations: list[VisionObservation] = []
+        expected_rows = []
+        row_index = 0
+        for term, gender, age_start, count in (
+            ("3年交", "男性", 3, 22),
+            ("5年交", "女性", 0, 8),
+        ):
+            for offset in range(count):
+                age = age_start + offset
+                values = (
+                    term,
+                    gender,
+                    str(age),
+                    *(f"{column * 1000 + age}.25" for column in range(1, 7)),
+                )
+                expected_rows.append(values)
+                observations.extend(
+                    _observation(
+                        100 + column * 100,
+                        100 + row_index * 40,
+                        value,
+                    )
+                    for column, value in enumerate(values)
+                )
+                row_index += 1
+        # A few ordinary OCR misses are recovered only in the repeated
+        # metadata/age columns; numeric value cells remain evidence-only.
+        observations = [
+            item
+            for item in observations
+            if not (
+                item.y == 100 + 5 * 40 and item.x in {100, 200, 300}
+            )
+        ]
+
+        result = reconstruct_numeric_matrix_from_observations(observations)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        table = parse_table(result.markdown)
+        self.assertIsNotNone(table)
+        assert table is not None
+        self.assertEqual(result.rows, 30)
+        self.assertEqual(result.cols, 9)
+        self.assertEqual(result.row_starts, (3, 0))
+        self.assertEqual(table.header, expected_rows[0])
+        self.assertEqual(table.rows, tuple(expected_rows[1:]))
+
+    def test_reconstructs_headerless_triangular_numeric_grid(self) -> None:
+        observations = []
+        expected_rows = []
+        for row in range(36):
+            values = [str(50 + row)]
+            for column in range(24 - row // 3):
+                values.append(str(3_000 + row * 10 + column))
+            expected_rows.append(tuple(values))
+            observations.extend(
+                _observation(
+                    100 + column * 80,
+                    100 + row * 30,
+                    value,
+                )
+                for column, value in enumerate(values)
+            )
+
+        result = reconstruct_numeric_matrix_from_observations(observations)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        table = parse_table(result.markdown)
+        self.assertIsNotNone(table)
+        assert table is not None
+        self.assertEqual(result.rows, 36)
+        self.assertEqual(result.cols, 25)
+        self.assertEqual(result.row_starts, (50,))
+        self.assertEqual(table.header[: len(expected_rows[0])], expected_rows[0])
+        self.assertEqual(
+            tuple(row[: len(expected)] for row, expected in zip(table.rows, expected_rows[1:])),
+            tuple(expected_rows[1:]),
+        )
+
+    def test_rejects_headerless_rectangular_numeric_grid_as_triangle(self) -> None:
+        observations = [
+            _observation(
+                100 + column * 80,
+                100 + row * 30,
+                str(50 + row) if column == 0 else str(3_000 + column),
+            )
+            for row in range(36)
+            for column in range(20)
+        ]
+
+        self.assertIsNone(reconstruct_numeric_matrix_from_observations(observations))
+
+    def test_rejects_headerless_fixed_grid_without_age_progression(self) -> None:
+        observations = []
+        for row in range(30):
+            values = (
+                "3年交",
+                "男性",
+                "7",
+                *(str(1000 + row * 10 + column) for column in range(6)),
+            )
+            observations.extend(
+                _observation(100 + column * 100, 100 + row * 40, value)
+                for column, value in enumerate(values)
+            )
+
+        self.assertIsNone(reconstruct_numeric_matrix_from_observations(observations))
+
     def test_reconstructs_repeated_matrices_with_shared_row_lattice(self) -> None:
         observations = [
             _observation(100, 20, "现金价值表"),
@@ -292,6 +583,67 @@ class VisionMatrixTest(unittest.TestCase):
         self.assertIn("现金价值表\n男性 一次性交付", result.markdown)
         self.assertIn("女性 3年交", result.markdown)
         self.assertIn("女性 4年交", result.markdown)
+
+    def test_reconstructs_paired_matrix_from_one_strong_sibling(self) -> None:
+        observations = []
+        for table_index, header_y in enumerate((100, 600)):
+            observations.append(_observation(100, header_y, "年度/年龄"))
+            observations.extend(
+                _observation(200 + age * 100, header_y, str(age))
+                for age in range(12)
+            )
+            for row in range(6):
+                y = header_y + 50 + row * 50
+                # The second table retains only one numeric row label. OCR
+                # commonly reports the other isolated glyphs as I/L.
+                if table_index == 0 or row == 5:
+                    observations.append(_observation(100, y, str(row + 1)))
+                elif row in {0, 4}:
+                    observations.append(
+                        _observation(100, y, "I" if row == 0 else "L")
+                    )
+                observations.extend(
+                    _observation(
+                        200 + age * 100,
+                        y,
+                        str(1_000 + table_index * 100 + row * 10 + age),
+                    )
+                    for age in range(12)
+                )
+
+        result = reconstruct_numeric_matrix_from_observations(observations)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.table_count, 2)
+        self.assertEqual(result.rows, 12)
+        self.assertEqual(result.cols, 13)
+        self.assertEqual(result.row_starts, (1, 1))
+        self.assertEqual(result.header_starts, (0, 0))
+        self.assertEqual(result.markdown.count("<table>"), 2)
+
+    def test_does_not_force_different_paired_matrix_topology(self) -> None:
+        observations = []
+        for table_index, (header_y, age_count) in enumerate(((100, 12), (600, 10))):
+            observations.append(_observation(100, header_y, "年度/年龄"))
+            observations.extend(
+                _observation(200 + age * 100, header_y, str(age))
+                for age in range(age_count)
+            )
+            for row in range(6):
+                y = header_y + 50 + row * 50
+                if table_index == 0 or row == 5:
+                    observations.append(_observation(100, y, str(row + 1)))
+                observations.extend(
+                    _observation(
+                        200 + age * 100,
+                        y,
+                        str(1_000 + table_index * 100 + row * 10 + age),
+                    )
+                    for age in range(age_count)
+                )
+
+        self.assertIsNone(reconstruct_numeric_matrix_from_observations(observations))
 
     def test_rejects_descriptive_sentence_as_matrix_header(self) -> None:
         observations = [
@@ -749,6 +1101,77 @@ class VisionMatrixTest(unittest.TestCase):
         self.assertFalse(table.header_is_explicit)
         self.assertEqual(table.header, expected[0])
         self.assertEqual(table.rows, tuple(expected[1:]))
+
+    def test_normalizes_repeated_payment_shorthand_in_sequential_records(self) -> None:
+        observations = []
+        for age in range(35):
+            y = 100 + age * 50
+            observations.extend(
+                [
+                    _observation(100, y, "5年"),
+                    _observation(200, y, "交"),
+                    _observation(300, y, str(age)),
+                    _observation(400, y, "男"),
+                    _observation(500, y, f"{900 + age}.10"),
+                    _observation(600, y, f"{950 + age}.20"),
+                    _observation(700, y, f"{1000 + age}.30"),
+                ]
+            )
+
+        result = reconstruct_numeric_matrix_from_observations(observations)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        table = parse_table(result.markdown)
+        self.assertIsNotNone(table)
+        assert table is not None
+        self.assertTrue(
+            all(row[1] == "趸交" for row in (table.header, *table.rows))
+        )
+
+    def test_normalizes_sparse_dominant_metadata_without_flattening_groups(self) -> None:
+        grid = [["5年", "男"] for _ in range(18)]
+        grid.extend([["5午", ""], ["5年", ""]])
+
+        _normalize_dominant_metadata_columns(grid, columns=range(2))
+
+        self.assertTrue(all(row[0] == "5年" for row in grid))
+        self.assertTrue(all(row[1] == "男" for row in grid))
+
+    def test_normalizes_sparse_all_zero_decimal_column(self) -> None:
+        grid = [["0.00"] for _ in range(15)]
+        grid.extend([["000"], [""], ["0.00"]])
+
+        _normalize_repeated_zero_decimal_columns(grid, columns=range(1))
+
+        self.assertTrue(all(row[0] == "0.00" for row in grid))
+
+    def test_collapses_a_phantom_numeric_column_proven_by_nonnegative_axis(self) -> None:
+        grid = [
+            [str(index), "100.00", "200.00", "300.00", "47", "9.52",
+             "500.00", "600.00", "700.00", "800.00"]
+            for index in range(20)
+        ]
+        confidence = [[0.99 for _ in row] for row in grid]
+        x_centers = [0.0, 50.0, 100.0, 150.0, 182.0, 200.0,
+                     250.0, 300.0, 350.0, 400.0]
+        header_axis = [
+            _observation(50.0 + value * 50.0, 50.0, str(value))
+            for value in range(8)
+        ]
+
+        collapsed = _collapse_phantom_split_numeric_column(
+            grid=grid,
+            confidence=confidence,
+            x_centers=x_centers,
+            header_axis=header_axis,
+            header_start=-1,
+        )
+
+        self.assertTrue(collapsed)
+        self.assertEqual(len(x_centers), 9)
+        self.assertTrue(all(row[4] == "479.52" for row in grid))
+        self.assertTrue(all(len(row) == 9 for row in grid))
 
 
 def _observation(x: float, y: float, text: str) -> VisionObservation:

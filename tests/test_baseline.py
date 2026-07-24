@@ -25,8 +25,14 @@ from afac_pipeline.baseline import (
     _maybe_local_long_text_repair,
     _maybe_local_matrix_repair,
     _maybe_repair_short_table,
+    _local_matrix_repair_is_better,
+    _largest_pipe_numeric_sequence_gap,
+    _merge_partial_sequence_row,
+    _merge_previous_sequence_table_cells,
+    _preserve_pipe_table_context,
     _repair_is_better,
     _fit_grid_to_call_budget,
+    _local_matrix_geometry_config,
     _table_repair_grid,
     _table_repair_trigger_chars,
     _table_repair_failed_part_budget,
@@ -275,6 +281,131 @@ class BaselineSubmissionTest(unittest.TestCase):
             )
         )
 
+    def test_huge_local_matrix_route_requires_a_material_sequence_gap(self) -> None:
+        record = _inked_record(
+            "sample.jpg",
+            source="memory",
+            size=(120, 120),
+            ink_box=(10, 10, 110, 110),
+        )
+        profile = replace(
+            profile_image(
+                image_bytes=record.read_bytes(),
+                sample_scale=1.0,
+            ),
+            width=10_000,
+            height=10_000,
+        )
+        config = BaselineConfig(
+            output_csv=Path("unused.csv"),
+            cache_dir=Path("unused-cache"),
+            table_local_ocr_backend="rapidocr",
+            table_local_ocr_min_pixels=10_000_000,
+            table_local_ocr_max_pixels=400_000_000,
+            table_local_ocr_huge_page_min_pixels=100_000_000,
+            table_local_ocr_huge_min_sequence_gap=8,
+            table_local_ocr_trigger_max_chars_per_content_pixel=1.0,
+        )
+        complete = _numeric_pipe_table((*range(0, 30),))
+        gapped = _numeric_pipe_table((*range(0, 20), *range(31, 40)))
+
+        self.assertEqual(_largest_pipe_numeric_sequence_gap(complete), 0)
+        self.assertEqual(_largest_pipe_numeric_sequence_gap(gapped), 11)
+        self.assertFalse(
+            _should_attempt_local_matrix_repair(
+                profile=profile,
+                previous_markdown=complete,
+                config=config,
+            )
+        )
+        self.assertTrue(
+            _should_attempt_local_matrix_repair(
+                profile=profile,
+                previous_markdown=gapped,
+                config=config,
+            )
+        )
+
+    def test_local_table_repair_preserves_compatible_remote_context(self) -> None:
+        previous = (
+            "# Accurate remote title\n\n"
+            "| Year | Value |\n"
+            "| --- | --- |\n"
+            "| 0 | 10 |\n"
+            "\nRemote footnote\n"
+        )
+        repaired = (
+            "# Noisy local tit1e\n\n"
+            "| Year | Value |\n"
+            "| --- | --- |\n"
+            "| 0 | 10 |\n"
+            "| 1 | 20 |\n"
+        )
+
+        self.assertEqual(
+            _preserve_pipe_table_context(previous, repaired),
+            (
+                "# Accurate remote title\n\n"
+                "| Year | Value |\n"
+                "| --- | --- |\n"
+                "| 0 | 10 |\n"
+                "| 1 | 20 |\n\n"
+                "Remote footnote\n"
+            ),
+        )
+
+    def test_local_table_context_accepts_the_same_numeric_axis_without_blanks(self) -> None:
+        previous = (
+            "# Accurate remote title\n\n"
+            "| Policy year | 1 | 2 |  | 3 | 4 |\n"
+            "| --- | --- | --- | --- | --- | --- |\n"
+            "| Age | 10 | 20 |  | 30 | 40 |\n"
+        )
+        repaired = (
+            "# Noisy local title\n\n"
+            "| Policy year\\Age | 1 | 2 | 3 | 4 |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "| 0 | 10 | 20 | 30 | 40 |\n"
+        )
+
+        merged = _preserve_pipe_table_context(previous, repaired)
+
+        self.assertTrue(merged.startswith("# Accurate remote title"))
+        self.assertIn("| Policy year\\Age | 1 | 2 | 3 | 4 |", merged)
+        self.assertNotIn("Noisy local title", merged)
+
+    def test_sequence_gap_repair_preserves_existing_nonempty_cells(self) -> None:
+        previous = (
+            "# Trusted title\n\n"
+            "| Year | A | B |\n"
+            "| --- | --- | --- |\n"
+            + "".join(f"| {key} | old-{key} |  |\n" for key in range(12))
+            + "\n"
+            + "".join(f"| {key} | old-{key} | kept-{key} |\n" for key in range(20, 24))
+        )
+        repaired = (
+            "# Noisy title\n\n"
+            "| Year | A | B |\n"
+            "| --- | --- | --- |\n"
+            + "".join(f"| {key} | new-{key} | fill-{key} |\n" for key in range(24))
+        )
+
+        merged = _merge_previous_sequence_table_cells(previous, repaired)
+
+        self.assertTrue(merged.startswith("# Trusted title"))
+        self.assertIn("| 5 | old-5 | fill-5 |", merged)
+        self.assertIn("| 15 | new-15 | fill-15 |", merged)
+        self.assertIn("| 22 | old-22 | kept-22 |", merged)
+
+    def test_partial_sequence_row_aligns_around_a_missing_middle_band(self) -> None:
+        self.assertEqual(
+            _merge_partial_sequence_row(
+                ("78", "4,325", "4,324", "4,272", "4,265"),
+                ("78", "4.325", "4.324", "4.320", "4.319", "4.272", "4.265"),
+            ),
+            ("78", "4,325", "4,324", "4.320", "4.319", "4,272", "4,265"),
+        )
+
     def test_local_long_text_route_requires_sparse_remote_and_material_coverage(self) -> None:
         record = _record("sample.jpg", size=(20, 120))
         config = BaselineConfig(
@@ -451,6 +582,18 @@ class BaselineSubmissionTest(unittest.TestCase):
                 "local_rapidocr_matrix",
             ),
         )
+        self.assertEqual(
+            _baseline_cache_namespace(local_enabled, "local_rapidocr_matrix"),
+            _baseline_cache_namespace(
+                replace(
+                    local_enabled,
+                    table_local_ocr_small_page_max_pixels=20_000_000,
+                    table_local_ocr_small_target_tile_width=800,
+                    table_local_ocr_small_target_tile_height=800,
+                ),
+                "local_rapidocr_matrix",
+            ),
+        )
         self.assertNotEqual(
             _baseline_cache_namespace(local_enabled, "table"),
             _baseline_cache_namespace(saturated_refinement, "table"),
@@ -478,6 +621,43 @@ class BaselineSubmissionTest(unittest.TestCase):
         )
 
         self.assertEqual(_table_repair_grid(record.read_bytes(), config), (2, 2))
+
+    def test_local_matrix_uses_small_page_geometry_without_changing_remote_grid(self) -> None:
+        record = _inked_record(
+            "small-local-table.jpg",
+            source="train",
+            size=(2_000, 1_600),
+            ink_box=(200, 200, 1_800, 1_400),
+        )
+        config = BaselineConfig(
+            output_csv=Path("unused.csv"),
+            cache_dir=Path("unused-cache"),
+            table_repair_target_tile_width=1_500,
+            table_repair_target_tile_height=800,
+            table_repair_content_scale=0.05,
+            table_repair_content_padding=150,
+            table_local_ocr_small_page_max_pixels=20_000_000,
+            table_local_ocr_small_target_tile_width=800,
+            table_local_ocr_small_target_tile_height=800,
+            table_local_ocr_small_content_scale=0.04,
+            table_local_ocr_small_content_padding=200,
+        )
+
+        local = _local_matrix_geometry_config(record.read_bytes(), config)
+
+        self.assertEqual(
+            (config.table_repair_target_tile_width, config.table_repair_content_scale),
+            (1_500, 0.05),
+        )
+        self.assertEqual(
+            (
+                local.table_repair_target_tile_width,
+                local.table_repair_target_tile_height,
+                local.table_repair_content_scale,
+                local.table_repair_content_padding,
+            ),
+            (800, 800, 0.04, 200),
+        )
 
     def test_repair_grid_keeps_very_tall_content_in_one_column(self) -> None:
         record = _inked_record(
@@ -521,6 +701,174 @@ class BaselineSubmissionTest(unittest.TestCase):
                 max_duplicate_line_ratio=0.30,
             )
         )
+
+    def test_strong_local_matrix_can_override_generic_cell_count_score(self) -> None:
+        config = BaselineConfig(
+            output_csv=Path("unused.csv"),
+            cache_dir=Path("unused-cache"),
+            table_repair_min_gain=300,
+            table_max_duplicate_line_ratio=0.30,
+        )
+        result = VisionMatrixResult(
+            markdown="unused",
+            rows=12,
+            cols=72,
+            populated_cells=860,
+            total_cells=864,
+            header_sequence_inliers=132,
+            row_sequence_inliers=6,
+            table_count=2,
+            row_starts=(1, 1),
+            header_starts=(0, 0),
+        )
+
+        with patch("afac_pipeline.baseline._repair_is_better", return_value=False):
+            self.assertTrue(
+                _local_matrix_repair_is_better(
+                    "x" * 1_000,
+                    "y" * 1_400,
+                    result=result,
+                    config=config,
+                )
+            )
+
+    def test_local_matrix_rejects_negative_policy_age_axis(self) -> None:
+        config = BaselineConfig(
+            output_csv=Path("unused.csv"),
+            cache_dir=Path("unused-cache"),
+            table_repair_min_gain=0,
+        )
+        result = VisionMatrixResult(
+            markdown="unused",
+            rows=12,
+            cols=8,
+            populated_cells=96,
+            total_cells=96,
+            header_sequence_inliers=7,
+            row_sequence_inliers=12,
+            header_starts=(-2,),
+        )
+        repaired = (
+            "| 年度/年龄 | -2 | -1 | 0 | 1 | 2 | 3 | 4 |\n"
+            "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+            + "".join(
+                f"| {year} | 1 | 1 | 1 | 1 | 1 | 1 | 1 |\n"
+                for year in range(12)
+            )
+        )
+
+        self.assertFalse(
+            _local_matrix_repair_is_better(
+                "short remote result",
+                repaired,
+                result=result,
+                config=config,
+            )
+        )
+
+    def test_local_matrix_can_replace_systematically_split_decimals(self) -> None:
+        header = "| Age | A | B | C | D |\n| --- | --- | --- | --- | --- |\n"
+        previous = "# Remote title\n\n" + header + "".join(
+            f"| {age} | {900 + age} | .50 | {1000 + age}. | 00 |\n"
+            for age in range(20)
+        )
+        repaired = "# Remote title\n\n" + header + "".join(
+            f"| {age} | {900 + age}.50 | {1000 + age}.00 | 0.00 | 0.00 |\n"
+            for age in range(20)
+        )
+        result = VisionMatrixResult(
+            markdown="unused",
+            rows=20,
+            cols=5,
+            populated_cells=100,
+            total_cells=100,
+            header_sequence_inliers=0,
+            row_sequence_inliers=20,
+        )
+        config = BaselineConfig(
+            output_csv=Path("unused.csv"),
+            cache_dir=Path("unused-cache"),
+            table_repair_min_gain=300,
+        )
+
+        with patch("afac_pipeline.baseline._repair_is_better", return_value=False):
+            self.assertTrue(
+                _local_matrix_repair_is_better(
+                    previous,
+                    repaired,
+                    result=result,
+                    config=config,
+                )
+            )
+
+    def test_exact_local_axes_can_replace_a_blank_split_numeric_header(self) -> None:
+        previous_header = (
+            "| Age | 1 | 2 |  | 3 | 4 | 5 |\n"
+            "| --- | --- | --- | --- | --- | --- | --- |\n"
+        )
+        previous = previous_header + "".join(
+            f"| {age} | {age}.1 | {age}.2 |  | {age}.3 | {age}.4 | {age}.5 |\n"
+            for age in range(20)
+        )
+        repaired_header = (
+            "| Age | 1 | 2 | 3 | 4 | 5 |\n"
+            "| --- | --- | --- | --- | --- | --- |\n"
+        )
+        repaired = repaired_header + "".join(
+            f"| {age} | {age}.1 | {age}.2 | {age}.3 | {age}.4 | {age}.5 |\n"
+            for age in range(20)
+        )
+        result = VisionMatrixResult(
+            markdown="unused",
+            rows=20,
+            cols=6,
+            populated_cells=120,
+            total_cells=120,
+            header_sequence_inliers=5,
+            row_sequence_inliers=20,
+        )
+        config = BaselineConfig(
+            output_csv=Path("unused.csv"),
+            cache_dir=Path("unused-cache"),
+            table_repair_min_gain=300,
+        )
+
+        with patch("afac_pipeline.baseline._repair_is_better", return_value=False):
+            self.assertTrue(
+                _local_matrix_repair_is_better(
+                    previous,
+                    repaired,
+                    result=result,
+                    config=config,
+                )
+            )
+
+    def test_weak_local_matrix_cannot_override_generic_score(self) -> None:
+        config = BaselineConfig(
+            output_csv=Path("unused.csv"),
+            cache_dir=Path("unused-cache"),
+            table_repair_min_gain=300,
+        )
+        result = VisionMatrixResult(
+            markdown="unused",
+            rows=12,
+            cols=72,
+            populated_cells=600,
+            total_cells=864,
+            header_sequence_inliers=132,
+            row_sequence_inliers=6,
+            table_count=2,
+        )
+
+        with patch("afac_pipeline.baseline._repair_is_better", return_value=False):
+            self.assertFalse(
+                _local_matrix_repair_is_better(
+                    "x" * 1_000,
+                    "y" * 1_400,
+                    result=result,
+                    config=config,
+                )
+            )
 
     def test_rejects_unstructured_content_grid_repair_before_caching(self) -> None:
         record = _record("sample.jpg")
@@ -1723,6 +2071,12 @@ def _inked_record(
         source=source,
         read_bytes=lambda: image_bytes,
     )
+
+
+def _numeric_pipe_table(keys: tuple[int, ...]) -> str:
+    lines = ["| Year | Value |", "| --- | --- |"]
+    lines.extend(f"| {key} | {key * 10} |" for key in keys)
+    return "\n".join(lines) + "\n"
 
 
 if __name__ == "__main__":

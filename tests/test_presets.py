@@ -11,6 +11,8 @@ from afac_pipeline.presets import (
     B_GENERALIZATION_V4,
     B_GENERALIZATION_V5,
     B_GENERALIZATION_V6,
+    B_GENERALIZATION_V7,
+    B_GENERALIZATION_V8,
     apply_baseline_preset,
 )
 
@@ -121,6 +123,40 @@ class BaselinePresetTest(unittest.TestCase):
         self.assertEqual(config.long_local_ocr_max_width, 2_000)
         self.assertEqual(config.long_local_ocr_trigger_char_density, 0.06)
         self.assertEqual(config.long_local_ocr_min_char_density, 0.08)
+
+    def test_b_generalization_v7_extends_density_route_with_small_page_geometry(self) -> None:
+        config = apply_baseline_preset(
+            BaselineConfig(output_csv=Path("submission.csv"), cache_dir=Path("cache")),
+            B_GENERALIZATION_V7,
+        )
+
+        self.assertEqual(config.table_local_ocr_min_pixels, 10_000_000)
+        self.assertEqual(config.table_local_ocr_max_pixels, 100_000_000)
+        self.assertEqual(config.table_local_ocr_trigger_max_chars, 7_000)
+        self.assertEqual(config.table_local_ocr_trigger_max_chars_per_content_pixel, 0.004)
+        self.assertEqual(config.table_local_ocr_small_page_max_pixels, 20_000_000)
+        self.assertEqual(
+            (
+                config.table_local_ocr_small_target_tile_width,
+                config.table_local_ocr_small_target_tile_height,
+                config.table_local_ocr_small_content_scale,
+                config.table_local_ocr_small_content_padding,
+            ),
+            (800, 800, 0.04, 200),
+        )
+
+    def test_b_generalization_v8_guards_huge_pages_by_sequence_gaps(self) -> None:
+        config = apply_baseline_preset(
+            BaselineConfig(output_csv=Path("submission.csv"), cache_dir=Path("cache")),
+            B_GENERALIZATION_V8,
+        )
+
+        self.assertEqual(config.table_local_ocr_min_pixels, 10_000_000)
+        self.assertEqual(config.table_local_ocr_max_pixels, 400_000_000)
+        self.assertEqual(config.table_local_ocr_huge_page_min_pixels, 100_000_000)
+        self.assertEqual(config.table_local_ocr_huge_min_sequence_gap, 8)
+        self.assertEqual(config.table_local_ocr_trigger_max_chars, 7_000)
+        self.assertEqual(config.table_local_ocr_workers, 8)
 
     def test_unknown_preset_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown baseline preset"):

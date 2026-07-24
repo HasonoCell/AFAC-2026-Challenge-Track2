@@ -11,6 +11,7 @@ import shutil
 import statistics
 import subprocess
 from collections import Counter
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from html import escape
@@ -279,6 +280,19 @@ def reconstruct_numeric_matrix_from_observations(
     headerless_wide_result = _reconstruct_headerless_wide_year_matrix(observations)
     if headerless_wide_result is not None:
         return headerless_wide_result
+    headerless_triangle_result = _reconstruct_headerless_triangular_numeric_grid(
+        observations
+    )
+    if headerless_triangle_result is not None:
+        return headerless_triangle_result
+    headerless_fixed_result = _reconstruct_headerless_fixed_value_grid(observations)
+    if headerless_fixed_result is not None:
+        return headerless_fixed_result
+    headerless_records_result = _reconstruct_headerless_sequential_records(
+        observations
+    )
+    if headerless_records_result is not None:
+        return headerless_records_result
     header_candidates = _matrix_header_candidates(observations)
     if not header_candidates:
         return None
@@ -358,6 +372,64 @@ def reconstruct_numeric_matrix_from_observations(
                 row_start_hint=shared_row_start,
             )
 
+    # A page containing exactly two shallow matrices cannot produce the
+    # two-table consensus above when one table loses its row-axis glyphs.  Use
+    # one sibling only when that sibling is itself exceptionally strong, then
+    # require the repaired table to independently match its complete topology
+    # and dense header axis.  This is useful for paired male/female cash-value
+    # tables while remaining too strict to coerce unrelated adjacent tables.
+    successful = [
+        (index, result)
+        for index, result in enumerate(results)
+        if result is not None
+    ]
+    missing = [index for index, result in enumerate(results) if result is None]
+    if len(header_candidates) == 2 and len(successful) == 1 and len(missing) == 1:
+        _, sibling = successful[0]
+        assert sibling is not None
+        sibling_is_strong = (
+            sibling.coverage >= 0.90
+            and sibling.header_starts
+            and sibling.row_starts
+            and sibling.header_sequence_inliers
+            >= max(5, math.ceil((sibling.cols - 1) * 0.70))
+            and sibling.row_sequence_inliers
+            >= max(3, math.ceil(sibling.rows * 0.50))
+        )
+        if sibling_is_strong:
+            index = missing[0]
+            semantic_header = header_candidates[index]
+            next_header = (
+                header_candidates[index + 1]
+                if index + 1 < len(header_candidates)
+                else None
+            )
+            lower = semantic_header.y - max(8.0, semantic_header.height * 0.60)
+            upper = (
+                next_header.y - max(8.0, next_header.height * 0.60)
+                if next_header is not None
+                else math.inf
+            )
+            repaired = _reconstruct_single_numeric_matrix(
+                [item for item in observations if lower <= item.y < upper],
+                semantic_header=semantic_header,
+                row_start_hint=sibling.row_starts[0],
+                header_start_hint=sibling.header_starts[0],
+                column_count_hint=sibling.cols,
+                row_count_hint=sibling.rows,
+            )
+            if (
+                repaired is not None
+                and repaired.coverage >= 0.85
+                and repaired.cols == sibling.cols
+                and repaired.rows == sibling.rows
+                and repaired.header_starts == sibling.header_starts
+                and repaired.row_starts == sibling.row_starts
+                and repaired.header_sequence_inliers
+                >= max(5, math.ceil((repaired.cols - 1) * 0.70))
+            ):
+                results[index] = repaired
+
     # A partial multi-table reconstruction is too risky to replace a remote
     # fallback: every strongly detected matrix must pass its own lattice guard.
     if any(result is None for result in results):
@@ -404,6 +476,628 @@ def reconstruct_numeric_matrix_from_observations(
         top_y=complete_results[0].top_y,
         bottom_y=complete_results[-1].bottom_y,
     )
+
+
+def _reconstruct_headerless_triangular_numeric_grid(
+    observations: list[VisionObservation],
+) -> VisionMatrixResult | None:
+    """Recover a pure-numeric, data-only triangular age/value matrix."""
+
+    numeric = _merge_split_numeric_fragments(
+        [item for item in observations if _numeric_value(item.text) is not None]
+    )
+    if len(numeric) < 300:
+        return None
+    median_height = statistics.median(item.height for item in numeric)
+    x_groups = _drop_sparse_close_x_groups(
+        [
+            group
+            for group in _cluster_observations(
+                numeric,
+                axis="x",
+                tolerance=max(8.0, median_height * 0.55),
+            )
+            if len(group) >= 3
+        ]
+    )
+    if not 14 <= len(x_groups) <= 128:
+        return None
+    observed_x_centers = [_axis_mean(group, "x") for group in x_groups]
+    gaps = [
+        right - left
+        for left, right in zip(observed_x_centers, observed_x_centers[1:])
+    ]
+    plausible_gaps = _central_gap_sample(gaps)
+    if not plausible_gaps:
+        return None
+    column_step = statistics.median(plausible_gaps)
+    if column_step <= 0:
+        return None
+    x_centers = [observed_x_centers[0]]
+    inserted_columns = 0
+    for left, right in zip(observed_x_centers, observed_x_centers[1:]):
+        gap = right - left
+        units = round(gap / column_step)
+        if (
+            2 <= units <= 3
+            and abs(gap - units * column_step) <= column_step * 0.25
+        ):
+            inserted_columns += units - 1
+            if inserted_columns > 4:
+                return None
+            x_centers.extend(left + column_step * index for index in range(1, units))
+        elif gap > column_step * 1.60:
+            return None
+        x_centers.append(right)
+
+    y_groups = [
+        group
+        for group in _cluster_observations(
+            numeric,
+            axis="y",
+            tolerance=max(5.0, median_height * 0.45),
+        )
+        if len(group) >= 2
+    ]
+    if not 30 <= len(y_groups) <= 200:
+        return None
+    y_centers = [_axis_mean(group, "y") for group in y_groups]
+    row_gaps = [
+        right - left for left, right in zip(y_centers, y_centers[1:])
+    ]
+    plausible_row_gaps = _central_gap_sample(row_gaps)
+    if not plausible_row_gaps:
+        return None
+    row_step = statistics.median(plausible_row_gaps)
+
+    grid = [["" for _ in x_centers] for _ in y_centers]
+    confidence = [[0.0 for _ in x_centers] for _ in y_centers]
+    for item in numeric:
+        column = _nearest_index(x_centers, item.x)
+        row = _nearest_index(y_centers, item.y)
+        if abs(x_centers[column] - item.x) > _axis_assignment_limit(
+            x_centers,
+            column,
+        ):
+            continue
+        if abs(y_centers[row] - item.y) > row_step * 0.45:
+            continue
+        text = _normalize_numeric_text(item.text)
+        if _numeric_value(text) is None:
+            continue
+        if item.confidence >= confidence[row][column]:
+            grid[row][column] = text
+            confidence[row][column] = item.confidence
+
+    observed_ages = [
+        (
+            value
+            if (value := _integer_value(row[0])) is not None and 0 <= value <= 200
+            else None
+        )
+        for row in grid
+    ]
+    age_evidence = sum(value is not None for value in observed_ages)
+    if age_evidence < math.ceil(len(grid) * 0.70):
+        return None
+    inferred = _infer_monotonic_age_sequence(observed_ages)
+    if inferred is None:
+        return None
+    ages, age_inliers = inferred
+    if age_inliers < math.ceil(age_evidence * 0.70):
+        return None
+    for row, age in zip(grid, ages, strict=True):
+        row[0] = str(age)
+
+    right_edges = [
+        max((index for index, value in enumerate(row[1:], start=1) if value), default=0)
+        for row in grid
+    ]
+    if any(edge == 0 for edge in right_edges):
+        return None
+    nonincreasing_pairs = sum(
+        right <= left + 1
+        for left, right in zip(right_edges, right_edges[1:])
+    )
+    if nonincreasing_pairs < math.ceil((len(right_edges) - 1) * 0.75):
+        return None
+    leading_edge = statistics.median(right_edges[: min(5, len(right_edges))])
+    trailing_edge = statistics.median(right_edges[-min(5, len(right_edges)):])
+    if leading_edge - trailing_edge < max(8, len(x_centers) // 4):
+        return None
+
+    populated_cells = sum(bool(cell) for row in grid for cell in row)
+    total_cells = len(grid) * len(x_centers)
+    coverage = populated_cells / total_cells
+    if not 0.25 <= coverage <= 0.80:
+        return None
+    table_rows = tuple(tuple(row) for row in grid)
+    markdown = table_to_html(
+        MarkdownTable(
+            header=table_rows[0],
+            rows=table_rows[1:],
+            header_is_explicit=False,
+        )
+    )
+    return VisionMatrixResult(
+        markdown=markdown,
+        rows=len(grid),
+        cols=len(x_centers),
+        populated_cells=populated_cells,
+        total_cells=total_cells,
+        header_sequence_inliers=0,
+        row_sequence_inliers=age_inliers,
+        row_starts=(ages[0],),
+        top_y=y_centers[0],
+        bottom_y=y_centers[-1],
+    )
+
+
+def _reconstruct_headerless_fixed_value_grid(
+    observations: list[VisionObservation],
+) -> VisionMatrixResult | None:
+    """Recover a data-only fixed-width actuarial table.
+
+    A recurring training/B layout has no printed header row: every physical
+    row is ``交费期 | 性别 | 年龄 | 数值...``.  Markdown OCR tends to invent a
+    different width for each crop, while local OCR retains a very strong
+    coordinate lattice.  This route is intentionally narrow: it requires
+    repeated ``N年交`` terms, explicit binary gender labels, adjacent age
+    progression, at least four value columns, and high cell coverage.
+    """
+
+    numeric = [
+        item for item in observations if _numeric_value(item.text) is not None
+    ]
+    nonnumeric = [
+        item for item in observations if _numeric_value(item.text) is None
+    ]
+    if len(numeric) < 100:
+        return None
+    lattice_observations = nonnumeric + _merge_split_numeric_fragments(numeric)
+    if len(lattice_observations) < 100:
+        return None
+    median_height = statistics.median(item.height for item in lattice_observations)
+    x_groups = _cluster_observations(
+        lattice_observations,
+        axis="x",
+        tolerance=max(8.0, median_height * 0.45),
+    )
+    maximum_x_evidence = max(map(len, x_groups), default=0)
+    minimum_x_evidence = max(8, math.ceil(maximum_x_evidence * 0.18))
+    x_groups = [group for group in x_groups if len(group) >= minimum_x_evidence]
+    x_centers = [_axis_mean(group, "x") for group in x_groups]
+    if not 7 <= len(x_centers) <= 20:
+        return None
+
+    term_columns = Counter(
+        _nearest_index(x_centers, item.x)
+        for item in lattice_observations
+        if re.fullmatch(r"\d{1,2}年交", re.sub(r"\s+", "", item.text))
+    )
+    gender_columns = Counter(
+        _nearest_index(x_centers, item.x)
+        for item in lattice_observations
+        if item.text.strip() in {"男性", "女性"}
+    )
+    if not term_columns or not gender_columns:
+        return None
+    term_column, term_column_inliers = term_columns.most_common(1)[0]
+    gender_column, gender_column_inliers = gender_columns.most_common(1)[0]
+    age_column = gender_column + 1
+    if (
+        term_column != 0
+        or gender_column != term_column + 1
+        or age_column >= len(x_centers) - 3
+    ):
+        return None
+
+    y_groups = _cluster_observations(
+        lattice_observations,
+        axis="y",
+        tolerance=max(5.0, median_height * 0.45),
+    )
+    minimum_row_cells = max(5, math.ceil(len(x_centers) * 0.65))
+    dense_y_groups = [group for group in y_groups if len(group) >= minimum_row_cells]
+    if len(dense_y_groups) < 20:
+        return None
+    y_centers = [_axis_mean(group, "y") for group in dense_y_groups]
+    row_count = len(y_centers)
+    if (
+        term_column_inliers < math.ceil(row_count * 0.70)
+        or gender_column_inliers < math.ceil(row_count * 0.70)
+    ):
+        return None
+    row_gaps = [
+        right - left for left, right in zip(y_centers, y_centers[1:])
+    ]
+    plausible_row_gaps = _central_gap_sample(row_gaps)
+    if not plausible_row_gaps:
+        return None
+    row_step = statistics.median(plausible_row_gaps)
+
+    grid = [["" for _ in x_centers] for _ in y_centers]
+    confidence = [[0.0 for _ in x_centers] for _ in y_centers]
+    for item in lattice_observations:
+        column = _nearest_index(x_centers, item.x)
+        row = _nearest_index(y_centers, item.y)
+        if abs(x_centers[column] - item.x) > _axis_assignment_limit(
+            x_centers,
+            column,
+        ):
+            continue
+        if abs(y_centers[row] - item.y) > row_step * 0.45:
+            continue
+        text = item.text.strip()
+        if column >= age_column:
+            text = _normalize_numeric_text(text)
+            if _numeric_value(text) is None:
+                continue
+        if item.confidence >= confidence[row][column]:
+            grid[row][column] = text
+            confidence[row][column] = item.confidence
+
+    observed_terms = [
+        (index, re.sub(r"\s+", "", row[term_column]))
+        for index, row in enumerate(grid)
+        if re.fullmatch(r"\d{1,2}年交", re.sub(r"\s+", "", row[term_column]))
+    ]
+    if len(observed_terms) < math.ceil(row_count * 0.70):
+        return None
+    for index, row in enumerate(grid):
+        if re.fullmatch(
+            r"\d{1,2}年交",
+            re.sub(r"\s+", "", row[term_column]),
+        ):
+            row[term_column] = re.sub(r"\s+", "", row[term_column])
+            continue
+        _, term = min(
+            observed_terms,
+            key=lambda item: abs(item[0] - index),
+        )
+        row[term_column] = term
+
+    observed_genders = [
+        (index, row[gender_column])
+        for index, row in enumerate(grid)
+        if row[gender_column] in {"男性", "女性"}
+    ]
+    if len(observed_genders) < math.ceil(row_count * 0.70):
+        return None
+    for index, row in enumerate(grid):
+        if row[gender_column] in {"男性", "女性"}:
+            continue
+        _, gender = min(
+            observed_genders,
+            key=lambda item: abs(item[0] - index),
+        )
+        row[gender_column] = gender
+
+    group_starts = [0]
+    for index in range(1, row_count):
+        if (
+            grid[index][term_column] != grid[index - 1][term_column]
+            or grid[index][gender_column] != grid[index - 1][gender_column]
+        ):
+            group_starts.append(index)
+    group_starts.append(row_count)
+    age_inliers = 0
+    age_evidence = 0
+    age_starts: list[int] = []
+    for start, end in zip(group_starts, group_starts[1:]):
+        if end - start < 3:
+            return None
+        observed_ages = [
+            value
+            for index in range(start, end)
+            if (value := _integer_value(grid[index][age_column])) is not None
+            and 0 <= value <= 120
+        ]
+        if len(observed_ages) < math.ceil((end - start) * 0.60):
+            return None
+        age_observations = [
+            (
+                value
+                if (value := _integer_value(grid[index][age_column])) is not None
+                and 0 <= value <= 120
+                else None
+            )
+            for index in range(start, end)
+        ]
+        inferred = _infer_monotonic_age_sequence(age_observations)
+        if inferred is None:
+            return None
+        inferred_ages, inliers = inferred
+        # A short trailing group can contain two or three OCR-confused age
+        # glyphs while every other metadata/cell coordinate remains exact.
+        # Seventy percent still requires a dominant monotonic progression and
+        # rejects constant/random numeric columns.
+        if inliers < math.ceil(len(observed_ages) * 0.70):
+            return None
+        age_starts.append(inferred_ages[0])
+        age_evidence += len(observed_ages)
+        age_inliers += inliers
+        for index, age in enumerate(inferred_ages, start=start):
+            grid[index][age_column] = str(age)
+
+    populated_cells = sum(bool(cell) for row in grid for cell in row)
+    total_cells = len(grid) * len(x_centers)
+    if populated_cells < math.ceil(total_cells * 0.80):
+        return None
+    table_rows = tuple(tuple(row) for row in grid)
+    markdown = table_to_html(
+        MarkdownTable(
+            header=table_rows[0],
+            rows=table_rows[1:],
+            header_is_explicit=False,
+        )
+    )
+    return VisionMatrixResult(
+        markdown=markdown,
+        rows=len(grid),
+        cols=len(x_centers),
+        populated_cells=populated_cells,
+        total_cells=total_cells,
+        header_sequence_inliers=0,
+        row_sequence_inliers=age_inliers,
+        row_starts=tuple(age_starts),
+        top_y=y_centers[0],
+        bottom_y=y_centers[-1],
+    )
+
+
+def _reconstruct_headerless_sequential_records(
+    observations: list[VisionObservation],
+) -> VisionMatrixResult | None:
+    """Recover a tall headerless record table with a resetting sequence axis."""
+
+    if len(observations) < 150:
+        return None
+    numeric = _merge_split_numeric_fragments(
+        [item for item in observations if _numeric_value(item.text) is not None]
+    )
+    nonnumeric = [
+        item for item in observations if _numeric_value(item.text) is None
+    ]
+    lattice = numeric + nonnumeric
+    median_height = statistics.median(item.height for item in lattice)
+    raw_x_groups = _cluster_observations(
+        lattice,
+        axis="x",
+        tolerance=max(8.0, median_height * 0.45),
+    )
+    maximum_x_evidence = max(map(len, raw_x_groups), default=0)
+    minimum_x_evidence = max(12, math.ceil(maximum_x_evidence * 0.25))
+    x_groups = [
+        group for group in raw_x_groups if len(group) >= minimum_x_evidence
+    ]
+    if not 5 <= len(x_groups) <= 12:
+        return None
+    x_centers = [_axis_mean(group, "x") for group in x_groups]
+    lattice = [item for group in x_groups for item in group]
+
+    y_groups = _cluster_observations(
+        lattice,
+        axis="y",
+        tolerance=max(5.0, median_height * 0.45),
+    )
+    minimum_row_cells = max(4, math.ceil(len(x_centers) * 0.60))
+    y_groups = [group for group in y_groups if len(group) >= minimum_row_cells]
+    if not 30 <= len(y_groups) <= 500:
+        return None
+    y_centers = [_axis_mean(group, "y") for group in y_groups]
+    row_gaps = [
+        right - left for left, right in zip(y_centers, y_centers[1:])
+    ]
+    plausible_row_gaps = _central_gap_sample(row_gaps)
+    if not plausible_row_gaps:
+        return None
+    row_step = statistics.median(plausible_row_gaps)
+    if row_step <= 0:
+        return None
+
+    grid = [["" for _ in x_centers] for _ in y_centers]
+    confidence = [[0.0 for _ in x_centers] for _ in y_centers]
+    for item in lattice:
+        column = _nearest_index(x_centers, item.x)
+        row = _nearest_index(y_centers, item.y)
+        if abs(x_centers[column] - item.x) > _axis_assignment_limit(
+            x_centers,
+            column,
+        ):
+            continue
+        if abs(y_centers[row] - item.y) > row_step * 0.45:
+            continue
+        text = item.text.strip()
+        if _numeric_value(text) is not None:
+            text = _normalize_numeric_text(text)
+        if text and item.confidence >= confidence[row][column]:
+            grid[row][column] = text
+            confidence[row][column] = item.confidence
+
+    sequence_candidates: list[tuple[int, int, int, int]] = []
+    for column in range(1, len(x_centers) - 1):
+        values = [
+            (
+                value
+                if (value := _integer_value(row[column])) is not None
+                and 0 <= value <= 10_000
+                else None
+            )
+            for row in grid
+        ]
+        evidence = sum(value is not None for value in values)
+        if evidence < math.ceil(len(grid) * 0.80):
+            continue
+        increments = 0
+        resets = 0
+        invalid = 0
+        for left, right in zip(values, values[1:]):
+            if left is None or right is None:
+                continue
+            if right == left + 1:
+                increments += 1
+            elif left >= 5 and 0 <= right <= 10:
+                resets += 1
+            else:
+                invalid += 1
+        compared = increments + resets + invalid
+        if (
+            increments < 30
+            or compared == 0
+            or invalid > max(2, math.floor(compared * 0.05))
+            or resets > 12
+        ):
+            continue
+        sequence_candidates.append((increments, evidence, -invalid, column))
+    if not sequence_candidates:
+        return None
+    _, sequence_evidence, _, sequence_column = max(sequence_candidates)
+
+    # A horizontal tile boundary can OCR one physical row twice: metadata and
+    # sequence on one side, then the trailing value on the other.  Remove only
+    # a non-sequence row sandwiched between two proven consecutive sequence
+    # values, merging its otherwise missing cells into the preceding row.
+    cleaned_grid: list[list[str]] = []
+    for index, row in enumerate(grid):
+        sequence = _integer_value(row[sequence_column])
+        if sequence is not None:
+            cleaned_grid.append(row)
+            continue
+        previous_sequence = (
+            _integer_value(cleaned_grid[-1][sequence_column])
+            if cleaned_grid
+            else None
+        )
+        next_sequence = (
+            _integer_value(grid[index + 1][sequence_column])
+            if index + 1 < len(grid)
+            else None
+        )
+        if (
+            cleaned_grid
+            and previous_sequence is not None
+            and next_sequence == previous_sequence + 1
+        ):
+            for column, value in enumerate(row):
+                if value and not cleaned_grid[-1][column]:
+                    cleaned_grid[-1][column] = value
+            continue
+        cleaned_grid.append(row)
+    grid = cleaned_grid
+
+    # Repair an isolated metadata OCR error only when both adjacent physical
+    # rows independently agree. This preserves real group transitions.
+    for index in range(1, len(grid) - 1):
+        for column in range(sequence_column):
+            left = grid[index - 1][column]
+            right = grid[index + 1][column]
+            if left and left == right and grid[index][column] != left:
+                grid[index][column] = left
+
+    repeated_text_columns = 0
+    for column in range(sequence_column):
+        values = [row[column] for row in grid if row[column]]
+        if not values:
+            continue
+        mode, mode_count = Counter(values).most_common(1)[0]
+        if _numeric_value(mode) is not None:
+            continue
+        if mode_count >= 10 and mode_count >= math.ceil(len(values) * 0.70):
+            repeated_text_columns += 1
+            for row in grid:
+                row[column] = mode
+    if repeated_text_columns < 2:
+        return None
+    _normalize_repeated_payment_shorthand(
+        grid,
+        columns=range(sequence_column),
+    )
+
+    value_columns = range(sequence_column + 1, len(x_centers))
+    numeric_value_cells = sum(
+        _numeric_value(row[column]) is not None
+        for row in grid
+        for column in value_columns
+    )
+    if numeric_value_cells < math.ceil(
+        len(grid) * len(tuple(value_columns)) * 0.70
+    ):
+        return None
+
+    populated_cells = sum(bool(cell) for row in grid for cell in row)
+    total_cells = len(grid) * len(x_centers)
+    if populated_cells < math.ceil(total_cells * 0.82):
+        return None
+    table_rows = tuple(tuple(row) for row in grid)
+    markdown = table_to_html(
+        MarkdownTable(
+            header=table_rows[0],
+            rows=table_rows[1:],
+            header_is_explicit=False,
+        )
+    )
+    first_sequence = _integer_value(grid[0][sequence_column])
+    return VisionMatrixResult(
+        markdown=markdown,
+        rows=len(grid),
+        cols=len(x_centers),
+        populated_cells=populated_cells,
+        total_cells=total_cells,
+        header_sequence_inliers=0,
+        row_sequence_inliers=sequence_evidence,
+        row_starts=((first_sequence,) if first_sequence is not None else ()),
+        top_y=y_centers[0],
+        bottom_y=y_centers[-1],
+    )
+
+
+def _infer_monotonic_age_sequence(
+    observations: list[int | None],
+) -> tuple[list[int], int] | None:
+    """Fit a bounded age path while allowing one or two omitted physical rows."""
+
+    if not observations:
+        return None
+    # score = mismatching observed glyphs, total absolute error, skipped-age
+    # gaps.  Exact OCR evidence dominates; the later terms only resolve ties.
+    states: dict[int, tuple[tuple[int, int, int], list[int]]] = {}
+    first = observations[0]
+    for age in range(121):
+        mismatch = int(first is not None and first != age)
+        error = abs(first - age) if first is not None else 0
+        states[age] = ((mismatch, error, 0), [age])
+    for observed in observations[1:]:
+        next_states: dict[int, tuple[tuple[int, int, int], list[int]]] = {}
+        for age in range(121):
+            candidates = [
+                (previous_age, states[previous_age])
+                for previous_age in range(max(0, age - 3), age)
+                if previous_age in states
+            ]
+            if not candidates:
+                continue
+            previous_age, (previous_score, previous_path) = min(
+                candidates,
+                key=lambda item: item[1][0],
+            )
+            score = (
+                previous_score[0] + int(observed is not None and observed != age),
+                previous_score[1] + (
+                    abs(observed - age) if observed is not None else 0
+                ),
+                previous_score[2] + (age - previous_age - 1),
+            )
+            next_states[age] = (score, [*previous_path, age])
+        states = next_states
+        if not states:
+            return None
+    _, (_, path) = min(states.items(), key=lambda item: item[1][0])
+    inliers = sum(
+        observed is not None and observed == age
+        for observed, age in zip(observations, path, strict=True)
+    )
+    return path, inliers
 
 
 def _reconstruct_wide_year_matrix(
@@ -788,6 +1482,23 @@ def _reconstruct_wide_year_matrix(
             for row_index in range(first, after_pair):
                 grid[row_index][schema.payment_column] = str(payment)
 
+    _normalize_repeated_payment_shorthand(
+        grid,
+        columns=range(len(schema.headers)),
+    )
+    _normalize_dominant_metadata_columns(
+        grid,
+        columns=(
+            column
+            for column in range(len(schema.headers))
+            if column != schema.age_column
+        ),
+    )
+    _normalize_repeated_zero_decimal_columns(
+        grid,
+        columns=range(len(schema.headers), len(grid[0])),
+    )
+
     headers = schema.headers + tuple(
         f"第{index}保单年度" for index in range(1, year_count + 1)
     )
@@ -833,6 +1544,99 @@ def _reconstruct_wide_year_matrix(
         top_y=header_y,
         bottom_y=y_centers[-1],
     )
+
+
+def _normalize_repeated_payment_shorthand(
+    grid: list[list[str]],
+    *,
+    columns: range,
+) -> None:
+    """Repair a repeated OCR ``交`` token when the row schema proves a term.
+
+    ``交`` alone is not a payment-period value in these actuarial tables, while
+    ``趸交`` is.  Apply the correction only when one metadata column is
+    overwhelmingly the shorthand and a separate metadata column independently
+    repeats a value containing ``年``.
+    """
+
+    modes: dict[int, tuple[str, int, int]] = {}
+    for column in columns:
+        values = [row[column].strip() for row in grid if row[column].strip()]
+        if len(values) < 10:
+            continue
+        mode, count = Counter(values).most_common(1)[0]
+        if count >= math.ceil(len(values) * 0.70):
+            modes[column] = (mode, count, len(values))
+    payment_columns = [
+        column for column, (mode, _, _) in modes.items() if mode == "交"
+    ]
+    has_term_column = any(
+        "年" in mode and column not in payment_columns
+        for column, (mode, _, _) in modes.items()
+    )
+    if not has_term_column:
+        return
+    for column in payment_columns:
+        for row in grid:
+            row[column] = "趸交"
+
+
+def _normalize_dominant_metadata_columns(
+    grid: list[list[str]],
+    *,
+    columns: Iterable[int],
+) -> None:
+    """Fill sparse metadata gaps when nearly every row proves one value.
+
+    Long actuarial matrices commonly repeat the term, payment method, and
+    gender on every physical row.  Local OCR can miss a few of those cells or
+    confuse one character (for example ``5年`` as ``5午``).  Restricting the
+    correction to an 85% row-level mode avoids flattening genuine group
+    transitions.
+    """
+
+    for column in columns:
+        values = [row[column].strip() for row in grid if row[column].strip()]
+        if len(values) < 10:
+            continue
+        mode, mode_count = Counter(values).most_common(1)[0]
+        if (
+            _numeric_value(mode) is not None
+            or mode_count < math.ceil(len(grid) * 0.85)
+        ):
+            continue
+        for row in grid:
+            current = row[column].strip()
+            if not current:
+                row[column] = mode
+                continue
+            if (
+                len(mode) >= 2
+                and len(current) == len(mode)
+                and sum(left != right for left, right in zip(current, mode, strict=True))
+                == 1
+            ):
+                row[column] = mode
+
+
+def _normalize_repeated_zero_decimal_columns(
+    grid: list[list[str]],
+    *,
+    columns: range,
+) -> None:
+    """Restore an all-zero fixed-decimal value column from sparse OCR."""
+
+    zero_spellings = {"0", "00", "000", "0.0", "0.00"}
+    for column in columns:
+        values = [row[column].strip() for row in grid if row[column].strip()]
+        if (
+            len(values) < 10
+            or not set(values).issubset(zero_spellings)
+            or values.count("0.00") < math.ceil(len(grid) * 0.60)
+        ):
+            continue
+        for row in grid:
+            row[column] = "0.00"
 
 
 def _is_wide_year_header_text(text: str) -> bool:
@@ -1352,6 +2156,7 @@ def _merge_split_numeric_fragments(
 
     if len(observations) < 8:
         return observations
+    observations = _merge_row_local_decimal_fragments(observations)
     median_height = statistics.median(item.height for item in observations)
     x_groups = _cluster_observations(
         observations,
@@ -1414,6 +2219,70 @@ def _merge_split_numeric_fragments(
     return [item for item in observations if id(item) not in consumed] + merged
 
 
+def _merge_row_local_decimal_fragments(
+    observations: list[VisionObservation],
+) -> list[VisionObservation]:
+    """Join one-off decimal fragments without requiring column-level support."""
+
+    if len(observations) < 2:
+        return observations
+    median_height = statistics.median(item.height for item in observations)
+    rows = _cluster_observations(
+        observations,
+        axis="y",
+        tolerance=max(4.0, median_height * 0.45),
+    )
+    consumed: set[int] = set()
+    merged: list[VisionObservation] = []
+    for row in rows:
+        ordered = sorted(row, key=lambda item: item.x)
+        for left, right in zip(ordered, ordered[1:]):
+            if id(left) in consumed or id(right) in consumed:
+                continue
+            if abs(left.y - right.y) > max(4.0, median_height * 0.45):
+                continue
+            box_gap = (
+                right.x
+                - right.width / 2
+                - (left.x + left.width / 2)
+            )
+            if not -median_height * 0.10 <= box_gap <= median_height * 0.75:
+                continue
+            left_text = _normalize_numeric_text(left.text)
+            right_text = _normalize_numeric_text(right.text)
+            if re.fullmatch(r"\.\d{1,4}", right_text):
+                combined = left_text + right_text
+            elif (
+                re.fullmatch(r"\d{3,6}", left_text)
+                and re.fullmatch(r"\d{2}", right_text)
+            ):
+                # At a tile edge the decimal point itself is often the only
+                # missing glyph: ``408`` + ``47`` represents ``408.47``.
+                combined = left_text + "." + right_text
+            else:
+                continue
+            if _numeric_value(combined) is None:
+                continue
+            consumed.update((id(left), id(right)))
+            merged.append(
+                VisionObservation(
+                    x=(left.x + right.x) / 2,
+                    y=(left.y + right.y) / 2,
+                    width=(
+                        right.x
+                        + right.width / 2
+                        - (left.x - left.width / 2)
+                    ),
+                    height=max(left.height, right.height),
+                    confidence=min(left.confidence, right.confidence),
+                    text=combined,
+                )
+            )
+    if not merged:
+        return observations
+    return [item for item in observations if id(item) not in consumed] + merged
+
+
 def _wide_year_header_candidate(
     observations: list[VisionObservation],
 ) -> VisionObservation | None:
@@ -1465,6 +2334,9 @@ def _reconstruct_single_numeric_matrix(
     *,
     semantic_header: VisionObservation,
     row_start_hint: int | None = None,
+    header_start_hint: int | None = None,
+    column_count_hint: int | None = None,
+    row_count_hint: int | None = None,
 ) -> VisionMatrixResult | None:
     """Reconstruct a regular matrix under the best justified x anchor.
 
@@ -1490,6 +2362,9 @@ def _reconstruct_single_numeric_matrix(
             anchored_observations,
             semantic_header=anchored_header,
             row_start_hint=row_start_hint,
+            header_start_hint=header_start_hint,
+            column_count_hint=column_count_hint,
+            row_count_hint=row_count_hint,
         )
         if result is not None:
             candidates.append(result)
@@ -1526,13 +2401,27 @@ def _reconstruct_single_numeric_matrix_for_anchor(
     *,
     semantic_header: VisionObservation,
     row_start_hint: int | None = None,
+    header_start_hint: int | None = None,
+    column_count_hint: int | None = None,
+    row_count_hint: int | None = None,
 ) -> VisionMatrixResult | None:
     header_y = semantic_header.y
+    header_axis = _numeric_header_axis_observations(
+        observations,
+        semantic_header=semantic_header,
+    )
+    minimum_body_y = header_y + max(4.0, semantic_header.height * 0.35)
+    if header_axis:
+        minimum_body_y = max(
+            minimum_body_y,
+            max(item.y + item.height / 2 for item in header_axis)
+            + max(2.0, semantic_header.height * 0.05),
+        )
 
     numeric_data = [
         item
         for item in observations
-        if item.y > header_y + max(4.0, semantic_header.height * 0.35)
+        if item.y > minimum_body_y
         and _numeric_value(item.text) is not None
     ]
     if len(numeric_data) < 16:
@@ -1549,13 +2438,36 @@ def _reconstruct_single_numeric_matrix_for_anchor(
     minimum_column_evidence = max(3, math.ceil(maximum_column_evidence * 0.18))
     x_groups = [group for group in x_groups if len(group) >= minimum_column_evidence]
     x_centers = [_axis_mean(group, "x") for group in x_groups]
+    # On a repeated shallow matrix, OCR can confuse nearly every isolated row
+    # label (notably ``1``/``5`` as ``I``/``L``) while retaining all value
+    # columns.  A successfully reconstructed sibling proves the exact table
+    # width and header origin.  Restore only one missing *leading* coordinate;
+    # the header sequence below must still independently align to that
+    # coordinate, so an internal or trailing omission remains rejected.
+    if (
+        column_count_hint is not None
+        and header_start_hint is not None
+        and len(x_centers) == column_count_hint - 1
+        and len(x_centers) >= 4
+    ):
+        x_gaps = [
+            right - left for left, right in zip(x_centers, x_centers[1:])
+        ]
+        plausible_x_gaps = _central_gap_sample(x_gaps)
+        if plausible_x_gaps:
+            x_step = statistics.median(plausible_x_gaps)
+            if x_step > 0:
+                x_centers.insert(0, x_centers[0] - x_step)
     if not 4 <= len(x_centers) <= 256:
+        return None
+    if column_count_hint is not None and len(x_centers) != column_count_hint:
         return None
 
     header_band_tolerance = max(16.0, semantic_header.height * 1.5)
     header_offsets: list[int] = []
-    for item in observations:
-        if abs(item.y - header_y) > header_band_tolerance:
+    header_observations = header_axis or observations
+    for item in header_observations:
+        if not header_axis and abs(item.y - header_y) > header_band_tolerance:
             continue
         value = _integer_value(item.text)
         if value is None:
@@ -1572,6 +2484,54 @@ def _reconstruct_single_numeric_matrix_for_anchor(
     header_start, header_sequence_inliers = Counter(header_offsets).most_common(1)[0]
     if header_sequence_inliers < max(3, len(x_centers) // 5):
         return None
+    if header_start_hint is not None and header_start != header_start_hint:
+        return None
+    if header_axis:
+        maximum_observed_header = max(
+            value
+            for item in header_axis
+            if (value := _integer_value(item.text)) is not None
+        )
+        represented_header_end = header_start + len(x_centers) - 2
+        missing_tail = maximum_observed_header - represented_header_end
+        if 1 <= missing_tail <= 4 and len(x_centers) >= 4:
+            annual_gaps = _central_gap_sample(
+                [
+                    right - left
+                    for left, right in zip(x_centers[1:], x_centers[2:])
+                ]
+            )
+            if annual_gaps:
+                annual_step = statistics.median(annual_gaps)
+                if annual_step > 0:
+                    x_centers.extend(
+                        x_centers[-1] + annual_step * index
+                        for index in range(1, missing_tail + 1)
+                    )
+                    # Re-evaluate the visible header evidence against the
+                    # completed tail. No header cell is synthesized; the
+                    # observed axis only restores its proven coordinates.
+                    header_offsets = []
+                    for item in header_axis:
+                        value = _integer_value(item.text)
+                        if value is None:
+                            continue
+                        column = _nearest_index(x_centers, item.x)
+                        if (
+                            column <= 0
+                            or abs(x_centers[column] - item.x)
+                            > _axis_assignment_limit(x_centers, column)
+                        ):
+                            continue
+                        header_offsets.append(value - (column - 1))
+                    if not header_offsets:
+                        return None
+                    (
+                        header_start,
+                        header_sequence_inliers,
+                    ) = Counter(header_offsets).most_common(1)[0]
+                    if header_start_hint is not None and header_start != header_start_hint:
+                        return None
 
     table_numeric = [
         item
@@ -1605,6 +2565,8 @@ def _reconstruct_single_numeric_matrix_for_anchor(
     row_count = len(y_centers)
     if not 4 <= row_count <= 10_000:
         return None
+    if row_count_hint is not None and row_count != row_count_hint:
+        return None
 
     grid = [["" for _ in x_centers] for _ in y_centers]
     confidence = [[0.0 for _ in x_centers] for _ in y_centers]
@@ -1622,6 +2584,42 @@ def _reconstruct_single_numeric_matrix_for_anchor(
             grid[row][column] = text
             confidence[row][column] = item.confidence
 
+    if _collapse_phantom_split_numeric_column(
+        grid=grid,
+        confidence=confidence,
+        x_centers=x_centers,
+        header_axis=header_axis,
+        header_start=header_start,
+    ):
+        header_offsets = []
+        for item in header_axis:
+            value = _integer_value(item.text)
+            if value is None:
+                continue
+            column = _nearest_index(x_centers, item.x)
+            if (
+                column <= 0
+                or abs(x_centers[column] - item.x)
+                > _axis_assignment_limit(x_centers, column)
+            ):
+                continue
+            header_offsets.append(value - (column - 1))
+        if not header_offsets:
+            return None
+        header_start, header_sequence_inliers = Counter(
+            header_offsets
+        ).most_common(1)[0]
+
+        while (
+            len(x_centers) > 4
+            and all(not row[-1] for row in grid)
+        ):
+            x_centers.pop()
+            for row in grid:
+                row.pop()
+            for row in confidence:
+                row.pop()
+
     row_offsets: list[int] = []
     for index, row in enumerate(grid):
         value = _integer_value(row[0])
@@ -1636,7 +2634,18 @@ def _reconstruct_single_numeric_matrix_for_anchor(
         if row_start_hint is None:
             return None
         hint_inliers = sum(offset == row_start_hint for offset in row_offsets)
-        if row_offsets and hint_inliers < max(2, math.ceil(len(row_offsets) * 0.60)):
+        strong_sibling_topology = (
+            header_start_hint is not None
+            and column_count_hint is not None
+            and row_count_hint is not None
+            and header_sequence_inliers
+            >= max(5, math.ceil((len(x_centers) - 1) * 0.70))
+        )
+        minimum_hint_inliers = 1 if strong_sibling_topology else 2
+        if row_offsets and hint_inliers < max(
+            minimum_hint_inliers,
+            math.ceil(len(row_offsets) * 0.60),
+        ):
             return None
         row_start = row_start_hint
     for index, row in enumerate(grid):
@@ -1674,6 +2683,109 @@ def _reconstruct_single_numeric_matrix_for_anchor(
     )
 
 
+def _collapse_phantom_split_numeric_column(
+    *,
+    grid: list[list[str]],
+    confidence: list[list[float]],
+    x_centers: list[float],
+    header_axis: list[VisionObservation],
+    header_start: int,
+) -> bool:
+    """Collapse one tile-seam fragment column proven by the printed axis.
+
+    Dense triangular tables sometimes split one currency column into a
+    left-prefix cluster and a right-suffix cluster.  That creates a synthetic
+    header origin of ``-1`` even though the visible header is the complete
+    ``0..N`` sequence.  Require both signals plus repeated row-level joins
+    before removing the phantom coordinate.
+    """
+
+    axis_values = sorted(
+        {
+            value
+            for item in header_axis
+            if (value := _integer_value(item.text)) is not None
+        }
+    )
+    if (
+        header_start != -1
+        or len(axis_values) < 8
+        or axis_values[0] < 0
+        or len(x_centers) < len(axis_values) + 2
+    ):
+        return False
+    gaps = [
+        right - left for left, right in zip(x_centers[1:], x_centers[2:])
+    ]
+    typical_sample = _central_gap_sample(gaps)
+    if not typical_sample:
+        return False
+    typical_gap = statistics.median(typical_sample)
+    if typical_gap <= 0:
+        return False
+
+    candidates: list[tuple[int, int]] = []
+    for column in range(2, len(x_centers) - 1):
+        split_gap = x_centers[column + 1] - x_centers[column]
+        span_from_previous = x_centers[column + 1] - x_centers[column - 1]
+        if (
+            split_gap >= typical_gap * 0.55
+            or not typical_gap * 0.75
+            <= span_from_previous
+            <= typical_gap * 1.25
+        ):
+            continue
+        join_count = sum(
+            _join_phantom_numeric_cells(row[column], row[column + 1]) is not None
+            for row in grid
+        )
+        if join_count >= max(5, math.ceil(len(grid) * 0.04)):
+            candidates.append((join_count, column))
+    if not candidates:
+        return False
+
+    _, column = max(candidates)
+    for row_index, row in enumerate(grid):
+        left = row[column]
+        right = row[column + 1]
+        joined = _join_phantom_numeric_cells(left, right)
+        if joined is not None:
+            combined = joined
+        elif left and right:
+            combined = (
+                left
+                if confidence[row_index][column]
+                >= confidence[row_index][column + 1]
+                else right
+            )
+        else:
+            combined = left or right
+        row[column + 1] = combined
+        confidence[row_index][column + 1] = max(
+            confidence[row_index][column],
+            confidence[row_index][column + 1],
+        )
+        row.pop(column)
+        confidence[row_index].pop(column)
+    x_centers.pop(column)
+    return True
+
+
+def _join_phantom_numeric_cells(left: str, right: str) -> str | None:
+    left = _normalize_numeric_text(left)
+    right = _normalize_numeric_text(right)
+    if not left or not right:
+        return None
+    if re.fullmatch(r"\d{1,3}", left) and re.fullmatch(
+        r"\d{1,2}\.\d{1,2}",
+        right,
+    ):
+        return left + right
+    if re.fullmatch(r"\d{3,6}", left) and re.fullmatch(r"\d{2}", right):
+        return left + "." + right
+    return None
+
+
 def _matrix_header_candidates(
     observations: list[VisionObservation],
 ) -> list[VisionObservation]:
@@ -1694,7 +2806,17 @@ def _matrix_header_candidates(
     age_labels = [
         item
         for item in observations
-        if "投保年龄" in re.sub(r"\s+", "", item.text)
+        if (
+            "投保年龄" in re.sub(r"\s+", "", item.text)
+            # Some insurers print the row-axis corner as just ``年龄`` with
+            # ``（周岁）`` in a separate box.  It is still a safe matrix label
+            # here because it must pair with a nearby explicit 保单年度 label
+            # and, when diagonally offset, a visible consecutive annual axis.
+            or re.fullmatch(
+                r"年龄(?:[（(]周岁[）)])?",
+                re.sub(r"\s+", "", item.text),
+            )
+        )
     ]
     for top_label in top_labels:
         for age_label in age_labels:
@@ -1713,12 +2835,24 @@ def _matrix_header_candidates(
                 minimum_x=max(top_label.x, age_label.x),
             ):
                 continue
+            top = min(
+                top_label.y - top_label.height / 2,
+                age_label.y - age_label.height / 2,
+            )
+            bottom = max(
+                top_label.y + top_label.height / 2,
+                age_label.y + age_label.height / 2,
+            )
             candidates.append(
                 VisionObservation(
                     x=top_label.x,
-                    y=top_label.y,
+                    y=(top + bottom) / 2,
                     width=max(top_label.width, age_label.width),
-                    height=max(top_label.height, age_label.height),
+                    # Treat the two visible labels as one physical header
+                    # box.  Using only a single-line height let the adjacent
+                    # horizontal age axis leak into numeric data as a fake
+                    # ``-1`` row on very dense tables.
+                    height=bottom - top,
                     confidence=min(top_label.confidence, age_label.confidence),
                     # Preserve the observed annual-label wording.  The
                     # generic matrix reconstruction only requires the
@@ -1728,6 +2862,22 @@ def _matrix_header_candidates(
                     text=f"{re.sub(r'\\s+', '', top_label.text)}\\投保年龄",
                 )
             )
+    # Some dense scans print only ``投保年龄`` over a horizontal age axis.
+    # RapidOCR can additionally split the diagonal corner into ``投保年`` and
+    # a small ``龄`` box on the following baseline.  Recover that label only
+    # when no explicit policy-year label exists on the page and a run of at
+    # least five consecutive integer headings is visible beside it.  Those
+    # two independent constraints keep ordinary prose containing 投保年龄 out
+    # of the matrix route.
+    if not top_labels:
+        for age_label in _standalone_age_label_candidates(observations):
+            if not _has_adjacent_integer_axis(
+                observations,
+                label=age_label,
+                minimum_x=age_label.x,
+            ):
+                continue
+            candidates.append(age_label)
     if not candidates:
         return []
     height = statistics.median(item.height for item in candidates)
@@ -1742,6 +2892,160 @@ def _matrix_header_candidates(
     )
 
 
+def _standalone_age_label_candidates(
+    observations: list[VisionObservation],
+) -> list[VisionObservation]:
+    labels = [
+        item
+        for item in observations
+        if re.fullmatch(
+            r"投保年龄(?:[（(]周岁[）)])?",
+            re.sub(r"\s+", "", item.text),
+        )
+    ]
+    suffixes = [
+        item
+        for item in observations
+        if re.sub(r"\s+", "", item.text) == "龄"
+    ]
+    for prefix in observations:
+        if re.sub(r"\s+", "", prefix.text) != "投保年":
+            continue
+        nearby = [
+            suffix
+            for suffix in suffixes
+            if 0 < suffix.y - prefix.y
+            <= max(32.0, (prefix.height + suffix.height) * 1.5)
+            and abs(suffix.x - prefix.x)
+            <= max(64.0, prefix.width + suffix.width)
+        ]
+        if not nearby:
+            continue
+        suffix = min(
+            nearby,
+            key=lambda item: (item.y - prefix.y, abs(item.x - prefix.x)),
+        )
+        left = min(
+            prefix.x - prefix.width / 2,
+            suffix.x - suffix.width / 2,
+        )
+        right = max(
+            prefix.x + prefix.width / 2,
+            suffix.x + suffix.width / 2,
+        )
+        top = min(
+            prefix.y - prefix.height / 2,
+            suffix.y - suffix.height / 2,
+        )
+        bottom = max(
+            prefix.y + prefix.height / 2,
+            suffix.y + suffix.height / 2,
+        )
+        labels.append(
+            VisionObservation(
+                # The small final character sits at the row-axis corner and
+                # is the more stable x anchor for the first numeric column.
+                x=suffix.x,
+                y=prefix.y,
+                width=right - left,
+                # Preserve the complete two-line extent.  Besides representing
+                # the observed glyphs accurately, this keeps the adjacent age
+                # headings in the header band rather than misclassifying them
+                # as the first numeric data row.
+                height=bottom - top,
+                confidence=min(prefix.confidence, suffix.confidence),
+                text="投保年龄",
+            )
+        )
+    return labels
+
+
+def _has_adjacent_integer_axis(
+    observations: list[VisionObservation],
+    *,
+    label: VisionObservation,
+    minimum_x: float,
+    minimum_run: int = 5,
+) -> bool:
+    band = max(16.0, label.height * 1.5)
+    values = sorted(
+        {
+            value
+            for item in observations
+            if abs(item.y - label.y) <= band and item.x > minimum_x
+            if (value := _integer_value(item.text)) is not None
+            and 0 <= value <= 254
+        }
+    )
+    longest = 0
+    previous: int | None = None
+    for value in values:
+        longest = longest + 1 if previous is not None and value == previous + 1 else 1
+        if longest >= minimum_run:
+            return True
+        previous = value
+    return False
+
+
+def _numeric_header_axis_observations(
+    observations: list[VisionObservation],
+    *,
+    semantic_header: VisionObservation,
+    minimum_run: int = 5,
+) -> list[VisionObservation]:
+    """Return one nearby horizontal integer axis with consecutive evidence."""
+
+    band = max(100.0, semantic_header.height * 2.0)
+    candidates = [
+        item
+        for item in observations
+        if abs(item.y - semantic_header.y) <= band
+        and (value := _integer_value(item.text)) is not None
+        and 0 <= value <= 254
+    ]
+    if not candidates:
+        return []
+    groups = _cluster_observations(
+        candidates,
+        axis="y",
+        tolerance=max(5.0, semantic_header.height * 0.25),
+    )
+
+    def consecutive_run(group: list[VisionObservation]) -> int:
+        values = sorted(
+            {
+                value
+                for item in group
+                if (value := _integer_value(item.text)) is not None
+            }
+        )
+        longest = 0
+        current = 0
+        previous: int | None = None
+        for value in values:
+            current = current + 1 if previous is not None and value == previous + 1 else 1
+            longest = max(longest, current)
+            previous = value
+        return longest
+
+    supported = [
+        (consecutive_run(group), group)
+        for group in groups
+        if consecutive_run(group) >= minimum_run
+    ]
+    if not supported:
+        return []
+    _, best = max(
+        supported,
+        key=lambda item: (
+            item[0],
+            len(item[1]),
+            -abs(_axis_mean(item[1], "y") - semantic_header.y),
+        ),
+    )
+    return best
+
+
 def _has_adjacent_annual_sequence(
     observations: list[VisionObservation],
     *,
@@ -1753,17 +3057,15 @@ def _has_adjacent_annual_sequence(
     The ordinary stacked-corner form keeps both labels in one narrow x band.
     Some source tables instead print ``投保年龄`` in the next small corner
     cell.  We accept that wider geometry only when the ``保单年度末`` row also
-    contains a sequential `1..5` annual axis to its right.
+    contains at least five consecutive annual values to its right.  Requiring
+    the literal `1..5` prefix made one missed OCR glyph (for example `4`)
+    discard an otherwise complete `5..75` axis.
     """
-
-    band = max(16.0, annual_label.height * 1.5)
-    annual_values = {
-        value
-        for item in observations
-        if abs(item.y - annual_label.y) <= band and item.x > minimum_x
-        if (value := _integer_value(item.text)) is not None and 1 <= value <= 254
-    }
-    return all(value in annual_values for value in range(1, 6))
+    return _has_adjacent_integer_axis(
+        observations,
+        label=annual_label,
+        minimum_x=minimum_x,
+    )
 
 
 def _is_matrix_header_text(text: str) -> bool:
